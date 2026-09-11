@@ -63,6 +63,10 @@ def make_outputs(
     Rmax_sim: float | None = None,
     tc: float | None = None,
     Uc: float | None = None,
+    y_grid=None,
+    Theta_sim=None,
+    T_sim=None,
+    vapor_concentration_sim=None,
     n_damaged: int = 0,
 ) -> NhkvOutputs:
     """Build the GUI's shared output container from dimensional arrays."""
@@ -98,6 +102,12 @@ def make_outputs(
         Rmax_sim=rmax,
         tc=float(tc),
         Uc=float(Uc),
+        y_grid=None if y_grid is None else np.asarray(y_grid, dtype=float).reshape(-1),
+        Theta_sim=None if Theta_sim is None else np.asarray(Theta_sim, dtype=float),
+        T_sim=None if T_sim is None else np.asarray(T_sim, dtype=float),
+        vapor_concentration_sim=(
+            None if vapor_concentration_sim is None
+            else np.asarray(vapor_concentration_sim, dtype=float)
+        ),
         n_damaged=int(n_damaged),
     )
-

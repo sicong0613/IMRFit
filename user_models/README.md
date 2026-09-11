@@ -212,9 +212,19 @@ Required fields:
 - `Rmax_sim`: scalar maximum simulated radius in meters
 - `tc`: scalar characteristic time in seconds
 - `Uc`: scalar characteristic velocity in m/s
+- `y_grid`: optional 1-D array of nondimensional bubble-interior radial
+  positions, usually from `0` at the center to `1` at the wall
+- `Theta_sim`: optional 2-D array of the internal nondimensional thermal
+  variable, with rows aligned to `t_sim` and columns aligned to `y_grid`
+- `T_sim`: optional 2-D array of bubble-interior temperature in K, with rows
+  aligned to `t_sim` and columns aligned to `y_grid`
+- `vapor_concentration_sim`: optional 2-D array of the vapor field variable,
+  with rows aligned to `t_sim` and columns aligned to `y_grid`
 - `n_damaged`: optional integer, use `0` if not applicable
 
-The arrays should all have the same length and contain finite numeric values.
+The 1-D curve arrays should all have the same length and contain finite numeric
+values. Optional 2-D bubble-interior fields should have shape
+`(len(t_sim), len(y_grid))`.
 Fitting uses `t_sim` and `R_sim` for interpolation against experimental data.
 Plotting and export use the other fields.
 

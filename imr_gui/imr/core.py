@@ -60,6 +60,10 @@ class NhkvOutputs:
     Rmax_sim: float
     tc: float
     Uc: float
+    y_grid: NDArray[np.float64] | None = None  # nondimensional bubble-interior radius
+    Theta_sim: NDArray[np.float64] | None = None  # internal nondimensional thermal variable, rows align with t_sim
+    T_sim: NDArray[np.float64] | None = None  # bubble-interior temperature, K, rows align with t_sim
+    vapor_concentration_sim: NDArray[np.float64] | None = None  # vapor field variable, rows align with t_sim
     n_damaged: int = 0  # number of damaged shells (GMOD only; 0 for NHKV)
 
 
@@ -330,6 +334,9 @@ def _simulate_lic_with_constitutive(
     R_nondim = X[:, 0]
     U_nondim = X[:, 1]
     P_nondim = X[:, 2]
+    Theta_sim = X[:, 4 : 4 + NT]
+    vapor_sim = X[:, 4 + NT : 4 + 2 * NT]
+    T_sim = ((A_star - 1 + np.sqrt(1 + 2 * A_star * Theta_sim)) / A_star) * inp.T_inf
 
     t_sim = t_nondim * tc
     R_sim = R_nondim * Rc
@@ -354,6 +361,10 @@ def _simulate_lic_with_constitutive(
         Rmax_sim=Rmax_sim,
         tc=float(tc),
         Uc=float(Uc),
+        y_grid=yk.astype(float),
+        Theta_sim=Theta_sim.astype(float),
+        T_sim=T_sim.astype(float),
+        vapor_concentration_sim=vapor_sim.astype(float),
     )
 
 
@@ -589,6 +600,9 @@ def simulate_nhkv_rmax_lic(inp: NhkvRmaxInputs) -> NhkvOutputs:
     R_nondim = X[:, 0]
     U_nondim = X[:, 1]
     P_nondim = X[:, 2]
+    Theta_sim = X[:, 4 : 4 + NT]
+    vapor_sim = X[:, 4 + NT : 4 + 2 * NT]
+    T_sim = ((A_star - 1 + np.sqrt(1 + 2 * A_star * Theta_sim)) / A_star) * inp.T_inf
 
     t_sim = t_nondim * tc
     R_sim = R_nondim * Rc
@@ -612,5 +626,9 @@ def simulate_nhkv_rmax_lic(inp: NhkvRmaxInputs) -> NhkvOutputs:
         Rmax_sim=Rmax_sim,
         tc=float(tc),
         Uc=float(Uc),
+        y_grid=yk.astype(float),
+        Theta_sim=Theta_sim.astype(float),
+        T_sim=T_sim.astype(float),
+        vapor_concentration_sim=vapor_sim.astype(float),
     )
 

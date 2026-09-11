@@ -314,6 +314,9 @@ def simulate(params_si: dict, tspan: float, context: dict):
     R_sim = x_sol[:, 0] * Rc
     U_sim = x_sol[:, 1] * Uc
     P_sim = x_sol[:, 2] * P_inf
+    Theta_sim = x_sol[:, 4 : 4 + NT]
+    T_sim = ((A_star - 1.0 + np.sqrt(1.0 + 2.0 * A_star * Theta_sim)) / A_star) * T_inf
+    vapor_sim = x_sol[:, 4 + NT : 4 + 2 * NT]
 
     return make_outputs(
         t_sim=t_sim,
@@ -322,4 +325,8 @@ def simulate(params_si: dict, tspan: float, context: dict):
         P_sim=P_sim,
         tc=tc,
         Uc=Uc,
+        y_grid=yk,
+        Theta_sim=Theta_sim,
+        T_sim=T_sim,
+        vapor_concentration_sim=vapor_sim,
     )

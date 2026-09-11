@@ -23,7 +23,7 @@ try:
     _HAS_MAT73 = True
 except ImportError:
     _HAS_MAT73 = False
-from PySide6.QtCore import QByteArray, QEvent, QMimeData, Qt, QThread, Signal, QTimer
+from PySide6.QtCore import QByteArray, QEvent, QMimeData, QRect, Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QActionGroup, QColor, QImage, QPen, QValidator
 from PySide6.QtWidgets import (
     QApplication,
@@ -55,6 +55,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStyle,
+    QStyleOptionSlider,
+    QStylePainter,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QTableWidget,
@@ -106,6 +108,165 @@ class _NoWheelComboBox(QComboBox):
 
     def wheelEvent(self, event):  # noqa: N802
         event.ignore()
+
+
+class _RangeSlider(QSlider):
+    """Small two-handle slider using visual positions from start to end."""
+
+    valuesChanged = Signal(int, int)
+    interactionStarted = Signal()
+    interactionFinished = Signal()
+
+    def __init__(self, orientation: Qt.Orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.setRange(0, 100)
+        self._lower = 0
+        self._upper = 100
+        self._active_handle: str | None = None
+        if orientation == Qt.Orientation.Vertical:
+            # Visual position 0 is the top and 100 is the bottom.
+            self.setInvertedAppearance(True)
+
+    def values(self) -> tuple[int, int]:
+        return self._lower, self._upper
+
+    def setValues(self, lower: int, upper: int):  # noqa: N802
+        lower = max(self.minimum(), min(int(lower), self.maximum()))
+        upper = max(self.minimum(), min(int(upper), self.maximum()))
+        lower, upper = sorted((lower, upper))
+        if lower == upper:
+            if upper < self.maximum():
+                upper += 1
+            else:
+                lower -= 1
+        if (lower, upper) == (self._lower, self._upper):
+            return
+        self._lower, self._upper = lower, upper
+        self.update()
+        self.valuesChanged.emit(lower, upper)
+
+    def _style_option(self, value: int) -> QStyleOptionSlider:
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        option.sliderPosition = value
+        option.sliderValue = value
+        return option
+
+    def _handle_rect(self, value: int):
+        return self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            self._style_option(value),
+            QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+
+    def paintEvent(self, _event):  # noqa: N802
+        painter = QStylePainter(self)
+        groove_option = self._style_option(self._lower)
+        groove_option.subControls = (
+            QStyle.SubControl.SC_SliderGroove
+            | QStyle.SubControl.SC_SliderTickmarks
+        )
+        painter.drawComplexControl(QStyle.ComplexControl.CC_Slider, groove_option)
+
+        groove_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            groove_option,
+            QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        lower_rect = self._handle_rect(self._lower)
+        upper_rect = self._handle_rect(self._upper)
+        highlight = self.palette().highlight().color()
+        track_thickness = 4
+        if self.orientation() == Qt.Orientation.Horizontal:
+            left = lower_rect.center().x()
+            right = upper_rect.center().x()
+            selected_rect = QRect(
+                left,
+                groove_rect.center().y() - track_thickness // 2,
+                max(1, right - left),
+                track_thickness,
+            )
+        else:
+            top = lower_rect.center().y()
+            bottom = upper_rect.center().y()
+            selected_rect = QRect(
+                groove_rect.center().x() - track_thickness // 2,
+                top,
+                track_thickness,
+                max(1, bottom - top),
+            )
+        painter.fillRect(selected_rect, highlight)
+
+        for value in (self._lower, self._upper):
+            handle_option = self._style_option(value)
+            handle_option.subControls = QStyle.SubControl.SC_SliderHandle
+            painter.drawComplexControl(QStyle.ComplexControl.CC_Slider, handle_option)
+
+    def _event_position(self, event) -> float:
+        return (
+            float(event.position().x())
+            if self.orientation() == Qt.Orientation.Horizontal
+            else float(event.position().y())
+        )
+
+    def _pixel_to_value(self, position: float) -> int:
+        length = self.width() if self.orientation() == Qt.Orientation.Horizontal else self.height()
+        fraction = max(0.0, min(1.0, position / max(1, length - 1)))
+        return int(round(self.minimum() + fraction * (self.maximum() - self.minimum())))
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        position = self._event_position(event)
+        lower_rect = self._handle_rect(self._lower)
+        upper_rect = self._handle_rect(self._upper)
+        if lower_rect.contains(event.position().toPoint()):
+            self._active_handle = "lower"
+        elif upper_rect.contains(event.position().toPoint()):
+            self._active_handle = "upper"
+        else:
+            lower_center = (
+                lower_rect.center().x()
+                if self.orientation() == Qt.Orientation.Horizontal
+                else lower_rect.center().y()
+            )
+            upper_center = (
+                upper_rect.center().x()
+                if self.orientation() == Qt.Orientation.Horizontal
+                else upper_rect.center().y()
+            )
+            self._active_handle = (
+                "lower" if abs(position - lower_center) <= abs(position - upper_center) else "upper"
+            )
+        self.interactionStarted.emit()
+        self._move_active_handle(position)
+        event.accept()
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._active_handle is None:
+            super().mouseMoveEvent(event)
+            return
+        self._move_active_handle(self._event_position(event))
+        event.accept()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if self._active_handle is None:
+            super().mouseReleaseEvent(event)
+            return
+        self._move_active_handle(self._event_position(event))
+        self._active_handle = None
+        self.interactionFinished.emit()
+        event.accept()
+
+    def _move_active_handle(self, position: float):
+        value = self._pixel_to_value(position)
+        if self._active_handle == "lower":
+            self.setValues(min(value, self._upper - 1), self._upper)
+        elif self._active_handle == "upper":
+            self.setValues(self._lower, max(value, self._lower + 1))
 
 
 class _MatDropFrame(QFrame):
@@ -626,6 +787,7 @@ class MainWindow(QMainWindow):
         self._model_param_memory: dict[str, dict] = {}
         self._available_models = load_available_models()
         self._multi_curve_enabled: bool = False
+        self._force_curve_view_render: bool = False
         self._view_curves: list[dict] = []
         self._view_color_presets: list[dict] = self._load_view_color_presets()
         self._curve_color_mode: str = "distinct"
@@ -804,6 +966,27 @@ class MainWindow(QMainWindow):
         row_req.setColumnStretch(3, 1)
         exp_lay.addLayout(row_req)
 
+        row_rmax = QHBoxLayout()
+        row_rmax.addWidget(QLabel("Rmax (um)"))
+        self.spin_Rmax_um = _NoWheelSpinBox()
+        self.spin_Rmax_um.setRange(0.001, 1e6)
+        self.spin_Rmax_um.setDecimals(6)
+        self.spin_Rmax_um.setValue(100.0)
+        self.spin_Rmax_um.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_Rmax_um.setToolTip(
+            "Peak radius used by NHKV (Rmax). For other models it is shown as a reference value."
+        )
+        row_rmax.addWidget(self.spin_Rmax_um, stretch=1)
+        self.chk_Rmax_auto = QCheckBox("Auto from experiment")
+        self.chk_Rmax_auto.setChecked(True)
+        self.chk_Rmax_auto.setToolTip(
+            "When experiment data is loaded, update Rmax from the detected experimental peak. "
+            "If no experiment is loaded, the manual Rmax value is used."
+        )
+        self.chk_Rmax_auto.toggled.connect(lambda _checked: self._sync_rmax_from_experiment())
+        row_rmax.addWidget(self.chk_Rmax_auto)
+        exp_lay.addLayout(row_rmax)
+
         row_tspan = QHBoxLayout()
         row_tspan.addWidget(QLabel("tspan (µs)"))
         self.spin_tspan_us = _NoWheelSpinBox()
@@ -979,19 +1162,20 @@ class MainWindow(QMainWindow):
         canvas_grid.setContentsMargins(0, 0, 0, 0)
         canvas_grid.setSpacing(2)
 
-        self.slider_y_zoom = QSlider(Qt.Vertical)
-        self.slider_y_zoom.setRange(10, 100)
-        self.slider_y_zoom.setValue(100)
-        self.slider_y_zoom.setInvertedAppearance(True)  # top = more zoomed in
-        self.slider_y_zoom.setToolTip("Y-axis zoom: slide up to zoom in")
+        self.slider_y_zoom = _RangeSlider(Qt.Vertical)
+        self.slider_y_zoom.setValues(0, 100)
+        self.slider_y_zoom.setToolTip(
+            "Y-axis range: drag the top or bottom handle to crop from that side"
+        )
 
         self.canvas = MplCanvas()
         self.canvas.set_drag_callback(self._on_fit_window_dragged)
 
-        self.slider_x_zoom = QSlider(Qt.Horizontal)
-        self.slider_x_zoom.setRange(10, 100)
-        self.slider_x_zoom.setValue(100)
-        self.slider_x_zoom.setToolTip("X-axis zoom: slide left to zoom in")
+        self.slider_x_zoom = _RangeSlider(Qt.Horizontal)
+        self.slider_x_zoom.setValues(0, 100)
+        self.slider_x_zoom.setToolTip(
+            "X-axis range: drag the left or right handle to crop from that side"
+        )
 
         btn_reset_zoom = QPushButton("↺")
         btn_reset_zoom.setFixedSize(24, 24)
@@ -1005,8 +1189,14 @@ class MainWindow(QMainWindow):
         canvas_grid.setColumnStretch(1, 1)
         canvas_grid.setRowStretch(0, 1)
 
-        self.slider_x_zoom.valueChanged.connect(self._on_x_zoom_changed)
-        self.slider_y_zoom.valueChanged.connect(self._on_y_zoom_changed)
+        self._x_zoom_anchor = None
+        self._y_zoom_anchor = None
+        self.slider_x_zoom.interactionStarted.connect(self._on_x_zoom_started)
+        self.slider_x_zoom.valuesChanged.connect(self._on_x_zoom_changed)
+        self.slider_x_zoom.interactionFinished.connect(self._on_x_zoom_finished)
+        self.slider_y_zoom.interactionStarted.connect(self._on_y_zoom_started)
+        self.slider_y_zoom.valuesChanged.connect(self._on_y_zoom_changed)
+        self.slider_y_zoom.interactionFinished.connect(self._on_y_zoom_finished)
 
         right_layout.addWidget(canvas_area, stretch=3)
 
@@ -1193,6 +1383,9 @@ class MainWindow(QMainWindow):
     def _on_curve_view_visibility_changed(self, visible: bool):
         if hasattr(self, "_act_curve_view"):
             self._act_curve_view.setChecked(bool(visible))
+        if visible and bool(getattr(self, "_multi_curve_enabled", False)):
+            self._seed_view_curves_from_current_canvas()
+            self._redraw_all()
 
     def _on_multi_curve_toggled(self, checked: bool):
         self._multi_curve_enabled = bool(checked)
@@ -1209,10 +1402,16 @@ class MainWindow(QMainWindow):
 
     def _curve_view_active(self) -> bool:
         return (
-            bool(getattr(self, "_multi_curve_enabled", False))
-            and hasattr(self, "_curve_view_dock")
-            and self._curve_view_dock.isVisible()
+            bool(getattr(self, "_force_curve_view_render", False))
+            or (
+                bool(getattr(self, "_multi_curve_enabled", False))
+                and hasattr(self, "_curve_view_dock")
+                and self._curve_view_dock.isVisible()
+            )
         )
+
+    def _curve_collection_enabled(self) -> bool:
+        return bool(getattr(self, "_multi_curve_enabled", False))
 
     def eventFilter(self, obj, event):  # noqa: N802
         if (
@@ -1596,6 +1795,42 @@ class MainWindow(QMainWindow):
     def _current_sim_R_eq_m(self) -> float:
         return float(self.spin_Req_um.value()) * 1e-6
 
+    def _manual_Rmax_m(self) -> float:
+        if hasattr(self, "spin_Rmax_um"):
+            value = float(self.spin_Rmax_um.value()) * 1e-6
+            if np.isfinite(value) and value > 0.0:
+                return value
+        return self._current_sim_R_eq_m()
+
+    def _experiment_Rmax_m(self) -> float | None:
+        if self.state.exp_t is None or self.state.exp_R is None:
+            return None
+        try:
+            value = float(find_rmax_value(self.state.exp_t, self.state.exp_R))
+        except Exception:
+            return None
+        if np.isfinite(value) and value > 0.0:
+            return value
+        return None
+
+    def _sync_rmax_from_experiment(self, *, force: bool = False) -> float | None:
+        if not hasattr(self, "spin_Rmax_um"):
+            return None
+        if not force and hasattr(self, "chk_Rmax_auto") and not self.chk_Rmax_auto.isChecked():
+            return None
+        rmax = self._experiment_Rmax_m()
+        if rmax is None:
+            return None
+        self.spin_Rmax_um.setValue(rmax * 1e6)
+        return rmax
+
+    def _current_Rmax_exp_m(self, *, sync_widget: bool = True) -> float:
+        if hasattr(self, "chk_Rmax_auto") and self.chk_Rmax_auto.isChecked():
+            rmax = self._sync_rmax_from_experiment() if sync_widget else self._experiment_Rmax_m()
+            if rmax is not None:
+                return rmax
+        return self._manual_Rmax_m()
+
     def _on_req_exp_changed(self, value_um: float):
         self.state.R_eq = float(value_um) * 1e-6
         if self.state.view_mode == "normalized":
@@ -1711,32 +1946,107 @@ class MainWindow(QMainWindow):
         return 1.0, 1.0
 
     def _seed_view_curves_from_current_canvas(self):
-        if self._view_curves:
-            return
-        if self.state.exp_t is not None and self.state.exp_R is not None:
-            name = Path(self.state.exp_path).stem if self.state.exp_path else "exp data"
+        candidates: list[dict] = []
+        if self.state.mode == "jobs":
+            idx = self._selected_job_index() if hasattr(self, "tbl_jobs") else None
+            if idx is not None:
+                job = self._jobs[idx]
+                exp = dict(job.get("experiment", {}) or {})
+                if exp.get("t") is not None and exp.get("R") is not None:
+                    candidates.append({
+                        "type": "experiment",
+                        "t": exp.get("t"),
+                        "R": exp.get("R"),
+                        "legend": Path(str(exp.get("path", ""))).stem or f"job {idx + 1} experiment",
+                        "R_eq": exp.get("R_eq"),
+                        "P_inf": exp.get("P_inf"),
+                        "rho": exp.get("rho"),
+                    })
+                fit_t = job.get("best_fit_t")
+                fit_R = job.get("best_fit_R")
+                if fit_t is not None and fit_R is not None:
+                    candidates.append({
+                        "type": "simulation",
+                        "t": fit_t,
+                        "R": fit_R,
+                        "legend": str(job.get("legend", "")).strip() or f"job {idx + 1} fit",
+                        "meta": job.get("best_fit_meta"),
+                    })
+        else:
+            if self.state.exp_t is not None and self.state.exp_R is not None:
+                candidates.append({
+                    "type": "experiment",
+                    "t": self.state.exp_t,
+                    "R": self.state.exp_R,
+                    "legend": Path(self.state.exp_path).stem if self.state.exp_path else "exp data",
+                    "R_eq": self.state.R_eq,
+                    "P_inf": self.state.P_inf,
+                    "rho": self.state.rho,
+                })
+            if self.state.sim_t is not None and self.state.sim_R is not None:
+                candidates.append({
+                    "type": "simulation",
+                    "t": self.state.sim_t,
+                    "R": self.state.sim_R,
+                    "legend": f"{self._get_active_model_key()} simulation",
+                    "meta": self.state.sim_meta,
+                    "R_eq": self._current_sim_R_eq_m(),
+                    "P_inf": self.state.P_inf,
+                    "rho": self.state.rho,
+                })
+            if self.state.best_fit_t is not None and self.state.best_fit_R is not None:
+                candidates.append({
+                    "type": "simulation",
+                    "t": self.state.best_fit_t,
+                    "R": self.state.best_fit_R,
+                    "legend": f"{self._get_active_model_key()} fit",
+                    "meta": self.state.best_fit_meta,
+                    "R_eq": self._current_sim_R_eq_m(),
+                    "P_inf": self.state.P_inf,
+                    "rho": self.state.rho,
+                })
+
+        for candidate in candidates:
+            if self._view_contains_curve(
+                candidate["t"], candidate["R"], candidate["type"]
+            ):
+                continue
             self._add_curve_to_view(
-                curve_type="experiment",
-                t=self.state.exp_t,
-                R=self.state.exp_R,
-                legend=name,
-                R_eq=self.state.R_eq,
-                P_inf=self.state.P_inf,
-                rho=self.state.rho,
+                curve_type=candidate["type"],
+                t=candidate["t"],
+                R=candidate["R"],
+                legend=candidate["legend"],
+                meta=candidate.get("meta"),
+                R_eq=candidate.get("R_eq"),
+                P_inf=candidate.get("P_inf"),
+                rho=candidate.get("rho"),
                 redraw=False,
             )
-        if self.state.sim_t is not None and self.state.sim_R is not None:
-            self._add_curve_to_view(
-                curve_type="simulation",
-                t=self.state.sim_t,
-                R=self.state.sim_R,
-                legend=f"{self._get_active_model_key()} simulation",
-                meta=self.state.sim_meta,
-                R_eq=self._current_sim_R_eq_m(),
-                P_inf=self.state.P_inf,
-                rho=self.state.rho,
-                redraw=False,
-            )
+
+    def _view_contains_curve(
+        self,
+        t: np.ndarray,
+        R: np.ndarray,
+        curve_type: str,
+    ) -> bool:
+        t_arr = np.asarray(t, dtype=float).reshape(-1)
+        R_arr = np.asarray(R, dtype=float).reshape(-1)
+        n = min(t_arr.size, R_arr.size)
+        if n <= 0:
+            return False
+        curve_type = "experiment" if curve_type == "experiment" else "simulation"
+        for curve in self._view_curves:
+            if str(curve.get("type", "simulation")) != curve_type:
+                continue
+            existing_t = np.asarray(curve.get("t", []), dtype=float).reshape(-1)
+            existing_R = np.asarray(curve.get("R", []), dtype=float).reshape(-1)
+            if existing_t.size != n or existing_R.size != n:
+                continue
+            if np.array_equal(existing_t, t_arr[:n], equal_nan=True) and np.array_equal(
+                existing_R, R_arr[:n], equal_nan=True
+            ):
+                return True
+        return False
 
     def _add_curve_to_view(
         self,
@@ -2150,11 +2460,50 @@ class MainWindow(QMainWindow):
             )
 
     def _view_export_curves(self) -> list[dict]:
+        self._sync_curve_view_controls()
         return [
             curve
             for curve in self._view_curves
             if curve.get("visible", True)
         ] or list(self._view_curves)
+
+    def _sync_curve_view_controls(self):
+        """Commit the current Curve View editors before an export or copy."""
+        for row_index, widgets in enumerate(self._curve_row_widgets):
+            if row_index >= len(self._view_curves) or len(widgets) < 5:
+                continue
+            chk_show, cmb_type, le_legend, cmb_color, spin_width = widgets
+            curve = self._view_curves[row_index]
+            curve["visible"] = bool(chk_show.isChecked())
+            curve["type"] = str(cmb_type.currentData() or "simulation")
+            fallback = f"curve {row_index + 1}"
+            legend = self._normalise_legend_text(le_legend.text().strip() or fallback)
+            curve["legend"] = legend
+            if le_legend.text() != legend:
+                le_legend.blockSignals(True)
+                le_legend.setText(legend)
+                le_legend.blockSignals(False)
+            color_data = cmb_color.currentData()
+            if color_data != "__more__" and QColor(str(color_data)).isValid():
+                curve["color"] = QColor(str(color_data)).name()
+            curve["width"] = float(spin_width.value())
+
+    def _with_curve_view_render(self, callback):
+        """Render an export from Curve View state, even while its dock is hidden."""
+        self._sync_curve_view_controls()
+        was_active = self._curve_view_active()
+        old_force = bool(getattr(self, "_force_curve_view_render", False))
+        view_limits = self.canvas.capture_view_limits()
+        try:
+            self._force_curve_view_render = True
+            self._redraw_all()
+            self.canvas.restore_view_limits(view_limits)
+            return callback()
+        finally:
+            self._force_curve_view_render = old_force
+            if not was_active:
+                self._redraw_all()
+                self.canvas.restore_view_limits(view_limits)
 
     def _view_export_stem(self) -> str:
         if self.state.exp_path:
@@ -2240,6 +2589,9 @@ class MainWindow(QMainWindow):
             self.canvas.draw_idle()
 
     def _on_export_view_svg(self):
+        if not self._view_curves:
+            QMessageBox.information(self, "No curves", "There are no curves to export.")
+            return
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Curve View as .svg",
@@ -2248,7 +2600,6 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self._redraw_all()
 
         def _save():
             self.canvas.figure.savefig(
@@ -2260,11 +2611,13 @@ class MainWindow(QMainWindow):
                 bbox_inches="tight",
             )
 
-        self._with_transparent_canvas(_save)
+        self._with_curve_view_render(lambda: self._with_transparent_canvas(_save))
         self.statusBar().showMessage(f"Exported Curve View SVG: {path}")
 
     def _on_copy_view_png(self):
-        self._redraw_all()
+        if not self._view_curves:
+            QMessageBox.information(self, "No curves", "There are no curves to copy.")
+            return
 
         def _copy():
             buf = BytesIO()
@@ -2287,14 +2640,16 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setMimeData(mime)
 
         try:
-            self._with_transparent_canvas(_copy)
+            self._with_curve_view_render(lambda: self._with_transparent_canvas(_copy))
         except Exception as exc:
             QMessageBox.warning(self, "Copy view failed", str(exc))
             return
         self.statusBar().showMessage("Copied Curve View PNG to clipboard.")
 
     def _on_copy_view_svg(self):
-        self._redraw_all()
+        if not self._view_curves:
+            QMessageBox.information(self, "No curves", "There are no curves to copy.")
+            return
 
         def _copy():
             buf = BytesIO()
@@ -2318,7 +2673,7 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setMimeData(mime)
 
         try:
-            self._with_transparent_canvas(_copy)
+            self._with_curve_view_render(lambda: self._with_transparent_canvas(_copy))
         except Exception as exc:
             QMessageBox.warning(self, "Copy view failed", str(exc))
             return
@@ -2999,6 +3354,8 @@ class MainWindow(QMainWindow):
         out = {
             "active_model": active_model,
             "Req_um": ui.get("Req_um"),
+            "Rmax_um": ui.get("Rmax_um"),
+            "Rmax_auto": ui.get("Rmax_auto"),
             "tspan_us": ui.get("tspan_us"),
             "fit_window_auto": ui.get("fit_window_auto"),
             "fit_window_cycles": ui.get("fit_window_cycles"),
@@ -3159,6 +3516,8 @@ class MainWindow(QMainWindow):
                 "active_model": current_model,
                 "Req_um": float(self.spin_Req_um.value()),
                 "Req_exp_um": float(self.spin_Req_exp_um.value()),
+                "Rmax_um": float(self.spin_Rmax_um.value()),
+                "Rmax_auto": bool(self.chk_Rmax_auto.isChecked()),
                 "tspan_us": float(self.spin_tspan_us.value()),
                 "fit_window_auto": bool(self.chk_fit_window_cycles.isChecked()),
                 "fit_window_cycles": int(self.spin_fit_window_cycles.value()),
@@ -3282,6 +3641,10 @@ class MainWindow(QMainWindow):
             self.spin_Req_exp_um.setValue(float(ui["Req_exp_um"]))
         elif ui.get("Req_um") is not None and hasattr(self, "spin_Req_exp_um"):
             self.spin_Req_exp_um.setValue(float(ui["Req_um"]))
+        if ui.get("Rmax_um") is not None and hasattr(self, "spin_Rmax_um"):
+            self.spin_Rmax_um.setValue(float(ui["Rmax_um"]))
+        if ui.get("Rmax_auto") is not None and hasattr(self, "chk_Rmax_auto"):
+            self.chk_Rmax_auto.setChecked(bool(ui["Rmax_auto"]))
         if ui.get("tspan_us") is not None:
             self.spin_tspan_us.setValue(float(ui["tspan_us"]))
         if ui.get("fit_window_cycles") is not None:
@@ -3676,11 +4039,7 @@ class MainWindow(QMainWindow):
         bm = self._bubble_model
         plugin_entrypoint = self._plugin_entrypoint_for_model(key)
         if plugin_entrypoint:
-            Rmax_exp = (
-                find_rmax_value(self.state.exp_t, self.state.exp_R)
-                if self.state.exp_t is not None and self.state.exp_R is not None
-                else 0.0
-            )
+            Rmax_exp = self._current_Rmax_exp_m()
             return {
                 "solver_entrypoint": plugin_entrypoint,
                 "params_si": dict(params),
@@ -3699,11 +4058,7 @@ class MainWindow(QMainWindow):
                 P_inf=P_inf, rho=rho, bubble_model=bm, **solver, **const_kw,
             )
         elif key == "NHKV (Rmax)":
-            Rmax_exp = (
-                find_rmax_value(self.state.exp_t, self.state.exp_R)
-                if self.state.exp_t is not None and self.state.exp_R is not None
-                else Req
-            )
+            Rmax_exp = self._current_Rmax_exp_m()
             const_kw = {k: v for k, v in const.items()
                         if k in NhkvRmaxInputs.__dataclass_fields__}
             return NhkvRmaxInputs(
@@ -3771,11 +4126,7 @@ class MainWindow(QMainWindow):
         bm = self._bubble_model
         plugin_entrypoint = self._plugin_entrypoint_for_model(key)
         if plugin_entrypoint:
-            Rmax_exp = (
-                find_rmax_value(self.state.exp_t, self.state.exp_R)
-                if self.state.exp_t is not None and self.state.exp_R is not None
-                else 0.0
-            )
+            Rmax_exp = self._current_Rmax_exp_m(sync_widget=False)
             ctx = self._plugin_context(
                 model_key=key, Req=Req, NT=NT, P_inf=P_inf, rho=rho,
                 const=const, solver=solver, Rmax_exp=Rmax_exp,
@@ -3791,11 +4142,7 @@ class MainWindow(QMainWindow):
             )
             return simulate_nhkv_lic(inp)
         elif key == "NHKV (Rmax)":
-            Rmax_exp = (
-                find_rmax_value(self.state.exp_t, self.state.exp_R)
-                if self.state.exp_t is not None and self.state.exp_R is not None
-                else Req
-            )
+            Rmax_exp = self._current_Rmax_exp_m(sync_widget=False)
             const_kw = {k: v for k, v in const.items()
                         if k in NhkvRmaxInputs.__dataclass_fields__}
             inp = NhkvRmaxInputs(
@@ -3922,9 +4269,13 @@ class MainWindow(QMainWindow):
     # =====================================================================
 
     def set_view_mode(self, mode: str):
+        if mode == self.state.view_mode:
+            return
+        relative_view = self.canvas.capture_relative_view()
         self.state.view_mode = mode
         self._update_view_buttons()
         self._redraw_all()
+        self.canvas.restore_relative_view(relative_view)
 
     def _on_fit_window_changed(self):
         if self.state.mode in ("simulation", "fitting"):
@@ -4062,15 +4413,55 @@ class MainWindow(QMainWindow):
     # zoom callbacks
     # =====================================================================
 
-    def _on_x_zoom_changed(self, value: int):
-        self.canvas.zoom_x(value / 100.0)
+    def _on_x_zoom_started(self):
+        self._x_zoom_anchor = (
+            self.slider_x_zoom.values(),
+            tuple(self.canvas.ax.get_xlim()),
+        )
 
-    def _on_y_zoom_changed(self, value: int):
-        self.canvas.zoom_y(value / 100.0)
+    def _on_x_zoom_changed(self, lower: int, upper: int):
+        if self._x_zoom_anchor is None:
+            self._on_x_zoom_started()
+        (start_lower, start_upper), (x_left, x_right) = self._x_zoom_anchor
+        slider_span = max(1, start_upper - start_lower)
+        scale = (x_right - x_left) / slider_span
+        self.canvas.set_x_view(
+            x_left + (lower - start_lower) * scale,
+            x_right + (upper - start_upper) * scale,
+        )
+
+    def _on_x_zoom_finished(self):
+        self._x_zoom_anchor = None
+
+    def _on_y_zoom_started(self):
+        self._y_zoom_anchor = (
+            self.slider_y_zoom.values(),
+            tuple(self.canvas.ax.get_ylim()),
+        )
+
+    def _on_y_zoom_changed(self, top: int, bottom: int):
+        if self._y_zoom_anchor is None:
+            self._on_y_zoom_started()
+        (start_top, start_bottom), (y_bottom, y_top) = self._y_zoom_anchor
+        slider_span = max(1, start_bottom - start_top)
+        scale = (y_top - y_bottom) / slider_span
+        self.canvas.set_y_view(
+            y_bottom - (bottom - start_bottom) * scale,
+            y_top - (top - start_top) * scale,
+        )
+
+    def _on_y_zoom_finished(self):
+        self._y_zoom_anchor = None
 
     def _on_reset_zoom(self):
-        self.slider_x_zoom.setValue(100)
-        self.slider_y_zoom.setValue(100)
+        self.slider_x_zoom.blockSignals(True)
+        self.slider_y_zoom.blockSignals(True)
+        self.slider_x_zoom.setValues(0, 100)
+        self.slider_y_zoom.setValues(0, 100)
+        self.slider_x_zoom.blockSignals(False)
+        self.slider_y_zoom.blockSignals(False)
+        self._x_zoom_anchor = None
+        self._y_zoom_anchor = None
         self.canvas.reset_zoom()
 
     # =====================================================================
@@ -4078,6 +4469,7 @@ class MainWindow(QMainWindow):
     # =====================================================================
 
     def _redraw_all(self):
+        self.canvas.clear_data_tip()
         self.canvas.ax.clear()
         self.canvas.handles = PlotHandles()
         if self.state.view_mode == "dimensional":
@@ -4294,12 +4686,20 @@ class MainWindow(QMainWindow):
             xlim = self.canvas.ax.get_xlim()
             ylim = self.canvas.ax.get_ylim()
             self.canvas.set_data_bounds(xlim, ylim)
-            x_frac = self.slider_x_zoom.value() / 100.0
-            y_frac = self.slider_y_zoom.value() / 100.0
-            if x_frac < 0.999:
-                self.canvas.zoom_x(x_frac)
-            if y_frac < 0.999:
-                self.canvas.zoom_y(y_frac)
+            x_lower, x_upper = self.slider_x_zoom.values()
+            y_top, y_bottom = self.slider_y_zoom.values()
+            if (x_lower, x_upper) != (0, 100):
+                x_span = xlim[1] - xlim[0]
+                self.canvas.set_x_view(
+                    xlim[0] + x_span * x_lower / 100.0,
+                    xlim[0] + x_span * x_upper / 100.0,
+                )
+            if (y_top, y_bottom) != (0, 100):
+                y_span = ylim[1] - ylim[0]
+                self.canvas.set_y_view(
+                    ylim[1] - y_span * y_bottom / 100.0,
+                    ylim[1] - y_span * y_top / 100.0,
+                )
 
     # =====================================================================
     # import wizard
@@ -4676,7 +5076,7 @@ class MainWindow(QMainWindow):
                 tc = rmax / uc if uc > 0.0 and rmax > 0.0 else 1.0
                 sim_meta = {"Rmax": rmax, "t_rmax": t_rmax, "tc": tc}
 
-        if self._curve_view_active():
+        if self._curve_collection_enabled():
             self._add_curve_to_view(
                 curve_type=self._infer_curve_type(t, R),
                 t=t,
@@ -4697,9 +5097,10 @@ class MainWindow(QMainWindow):
                     P_inf=P_inf,
                     rho=rho,
                 )
-            self.statusBar().showMessage(f"Imported curve(s) into Curve View: {Path(path).name}")
-            self._redraw_all()
-            return
+            if self._curve_view_active():
+                self.statusBar().showMessage(f"Imported curve(s) into Curve View: {Path(path).name}")
+                self._redraw_all()
+                return
 
         if self.state.mode == "jobs":
             raise ValueError("Switch to Simulation or Fitting mode before importing experiment data.")
@@ -4727,6 +5128,7 @@ class MainWindow(QMainWindow):
             self.state.R_eq = float(np.mean(R[-min(20, R.size):]))
         if self.state.R_eq is not None:
             self._set_req_controls_from_exp(float(self.state.R_eq), update_sim=True)
+        self._sync_rmax_from_experiment()
         if P_inf is not None:
             self.spin_P_inf.setValue(float(P_inf))
         if rho is not None:
@@ -5548,6 +5950,7 @@ class MainWindow(QMainWindow):
 
             if self.state.R_eq is not None:
                 self._set_req_controls_from_exp(float(self.state.R_eq), update_sim=True)
+            self._sync_rmax_from_experiment()
 
             file_info = []
             if exp.P_inf is not None:
@@ -5580,7 +5983,7 @@ class MainWindow(QMainWindow):
                 if self.chk_fit_window_cycles.isChecked():
                     self._apply_fit_window_cycles()
 
-            if self._curve_view_active():
+            if self._curve_collection_enabled():
                 curve_legend = Path(path).stem
                 try:
                     curve_legend = self._curve_legend_from_mat(
@@ -5870,6 +6273,8 @@ class MainWindow(QMainWindow):
             "bounds_si": dict(bounds_si),
             "experiment_settings": {
                 "Req_um": float(req_m) * 1e6,
+                "Rmax_um": float(self.spin_Rmax_um.value()),
+                "Rmax_auto": bool(self.chk_Rmax_auto.isChecked()),
                 "tspan_us": float(self.spin_tspan_us.value()),
             },
             "fit_window": {
@@ -6027,6 +6432,8 @@ class MainWindow(QMainWindow):
             "bounds_si": dict(bounds_si),
             "experiment_settings": {
                 "Req_um": float(req_m) * 1e6,
+                "Rmax_um": float(self.spin_Rmax_um.value()),
+                "Rmax_auto": bool(self.chk_Rmax_auto.isChecked()),
                 "tspan_us": float(self.spin_tspan_us.value()),
             },
             "fit_window": {
@@ -6581,6 +6988,14 @@ class MainWindow(QMainWindow):
         settings = job.get("experiment_settings", {})
         if settings.get("Req_um") is not None:
             self.spin_Req_um.setValue(float(settings["Req_um"]))
+        if settings.get("Rmax_um") is not None and hasattr(self, "spin_Rmax_um"):
+            self.spin_Rmax_um.setValue(float(settings["Rmax_um"]))
+        if settings.get("Rmax_auto") is not None and hasattr(self, "chk_Rmax_auto"):
+            self.chk_Rmax_auto.setChecked(bool(settings["Rmax_auto"]))
+        elif hasattr(self, "chk_Rmax_auto"):
+            self.chk_Rmax_auto.setChecked(True)
+        if settings.get("Rmax_um") is None:
+            self._sync_rmax_from_experiment()
         if self.state.R_eq is not None and hasattr(self, "spin_Req_exp_um"):
             self.spin_Req_exp_um.setValue(float(self.state.R_eq) * 1e6)
         if settings.get("tspan_us") is not None:
@@ -6701,7 +7116,11 @@ class MainWindow(QMainWindow):
         exp_settings = job["experiment_settings"]
         t_exp_all = np.asarray(exp.get("t", []), dtype=float)
         R_exp_all = np.asarray(exp.get("R", []), dtype=float)
-        rmax_exp = find_rmax_value(t_exp_all, R_exp_all) if t_exp_all.size and R_exp_all.size else 0.0
+        rmax_exp = 0.0
+        if bool(exp_settings.get("Rmax_auto", True)) and t_exp_all.size and R_exp_all.size:
+            rmax_exp = find_rmax_value(t_exp_all, R_exp_all)
+        if not np.isfinite(float(rmax_exp)) or float(rmax_exp) <= 0.0:
+            rmax_exp = float(exp_settings.get("Rmax_um", exp_settings.get("Req_um", 0.0))) * 1e-6
         job_const = dict(job.get("constants", {}))
         job_const["c_long"] = float(phys.get("c_long", job_const.get("c_long", 1485.0)))
         job_const["gamma"] = float(phys.get("gamma", job_const.get("gamma", 0.056)))
@@ -7156,6 +7575,12 @@ class MainWindow(QMainWindow):
         gamma = self._none_if_nan(self._mat_to_float(mat, "gamma", None))
         tc = self._mat_to_float(mat, "tc", 1.0)
         rmax_sim = self._mat_to_float(mat, "Rmax_sim", float(np.max(R_sim)))
+        rmax_exp = self._none_if_nan(self._mat_to_float(mat, "Rmax_exp", None))
+        if rmax_exp is None and R_exp.size:
+            try:
+                rmax_exp = float(find_rmax_value(t_exp, R_exp))
+            except Exception:
+                rmax_exp = None
         lsq_err = self._none_if_nan(self._mat_to_float(mat, "LSQErr", None))
         status = "completed"
         error = None
@@ -7240,6 +7665,8 @@ class MainWindow(QMainWindow):
             "bounds_si": bounds_si,
             "experiment_settings": {
                 "Req_um": float(req_m) * 1e6 if req_m is not None else None,
+                "Rmax_um": float(rmax_exp) * 1e6 if rmax_exp is not None else None,
+                "Rmax_auto": rmax_exp is not None,
                 "tspan_us": tspan_us,
             },
             "fit_window": {
@@ -7352,6 +7779,24 @@ class MainWindow(QMainWindow):
             return None, n_points, "simulation LSQErr is not finite"
         return err, n_points, None
 
+    @staticmethod
+    def _add_sim_diagnostics_to_export(export: dict, out: NhkvOutputs):
+        """Append optional bubble-interior diagnostic fields to a MAT export."""
+        y_grid = getattr(out, "y_grid", None)
+        theta = getattr(out, "Theta_sim", None)
+        temp = getattr(out, "T_sim", None)
+        vapor = getattr(out, "vapor_concentration_sim", None)
+
+        if y_grid is not None:
+            export["y_grid"] = np.asarray(y_grid, dtype=float).reshape(1, -1)
+        if theta is not None:
+            export["Theta_sim"] = np.asarray(theta, dtype=float)
+        if temp is not None:
+            export["T_sim"] = np.asarray(temp, dtype=float)
+            export["T_sim_unit"] = "K"
+        if vapor is not None:
+            export["vapor_concentration_sim"] = np.asarray(vapor, dtype=float)
+
     def _build_job_sim_result_export(
         self,
         job: dict,
@@ -7403,6 +7848,7 @@ class MainWindow(QMainWindow):
             "NT": int(phys.get("NT", 0)),
             "LSQErr": np.nan if lsq_err is None else float(lsq_err),
         }
+        self._add_sim_diagnostics_to_export(export, out)
         legend = str(job.get("legend", "")).strip()
         if legend:
             export["legend"] = legend
@@ -7487,6 +7933,7 @@ class MainWindow(QMainWindow):
             "imr_result_kind": "fit",
             "LSQErr": float(res.lsq_err),
         }
+        self._add_sim_diagnostics_to_export(export, out)
         fit_window = dict(job.get("fit_window", {}) or {})
         export["fit_window_mode"] = str(fit_window.get("mode", ""))
         export["fit_window_cycles"] = (
@@ -8376,7 +8823,7 @@ class MainWindow(QMainWindow):
             self.state.sim_meta = {"Rmax": out.Rmax_sim, "t_rmax": 0.0, "tc": out.tc}
             self.state.sim_out = out
 
-            if self._curve_view_active():
+            if self._curve_collection_enabled():
                 self._add_curve_to_view(
                     curve_type="simulation",
                     t=out.t_sim,
@@ -8557,11 +9004,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        _rmax_exp = (
-            find_rmax_value(self.state.exp_t, self.state.exp_R)
-            if self.state.exp_t is not None and self.state.exp_R is not None
-            else 0.0
-        )
+        _rmax_exp = self._current_Rmax_exp_m()
         sim_spec = _SimSpec(
             model_key=self._get_active_model_key(),
             Req=float(self.spin_Req_um.value()) * 1e-6,
@@ -8722,6 +9165,18 @@ class MainWindow(QMainWindow):
                 "tc": res.tc or 1.0,
             }
             self.state.sim_out = res.sim_out
+            if self._curve_collection_enabled():
+                self._add_curve_to_view(
+                    curve_type="simulation",
+                    t=res.t_sim,
+                    R=res.R_sim,
+                    legend=f"{self._get_active_model_key()} fit {len(self._view_curves) + 1}",
+                    meta=self.state.sim_meta,
+                    R_eq=self._current_sim_R_eq_m(),
+                    P_inf=float(self.spin_P_inf.value()),
+                    rho=float(self.spin_rho.value()),
+                    redraw=False,
+                )
 
         self.state.best_fit_t = None
         self.state.best_fit_R = None
@@ -8827,6 +9282,7 @@ class MainWindow(QMainWindow):
             export["tc"]           = float(out.tc)
             export["Uc"]           = float(out.Uc)
             export["n_damaged"]    = int(out.n_damaged)
+            self._add_sim_diagnostics_to_export(export, out)
 
             # --- experimental (if loaded) ---
             if self.state.exp_t is not None and self.state.exp_R is not None:

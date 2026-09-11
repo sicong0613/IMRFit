@@ -6,6 +6,7 @@ from typing import Callable
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from PySide6.QtCore import QTimer
 
 
 @dataclass
@@ -45,9 +46,20 @@ class MplCanvas(FigureCanvas):
         self._pan_xlim: list | None = None
         self._pan_ylim: list | None = None
 
+        # MATLAB-like delayed data tips for plotted curves.
+        self._data_tip_delay_ms = 500
+        self._data_tip_pick_radius_px = 14.0
+        self._data_tip_candidate: dict | None = None
+        self._data_tip_annotation = None
+        self._data_tip_pinned = False
+        self._data_tip_timer = QTimer(self)
+        self._data_tip_timer.setSingleShot(True)
+        self._data_tip_timer.timeout.connect(self._show_pending_data_tip)
+
         self.mpl_connect("button_press_event", self._on_press)
         self.mpl_connect("button_release_event", self._on_release)
         self.mpl_connect("motion_notify_event", self._on_motion)
+        self.mpl_connect("axes_leave_event", self._on_axes_leave)
 
     # ---- draggable fit-window support ------------------------------------
 
@@ -86,6 +98,22 @@ class MplCanvas(FigureCanvas):
                 return
 
         # Not near a fit line — start pan
+        data_tip = self._nearest_data_tip(event)
+        if data_tip is not None:
+            if self._data_tip_pinned:
+                self._data_tip_pinned = False
+                self._hide_data_tip()
+                self._data_tip_candidate = data_tip
+                self._data_tip_timer.start(self._data_tip_delay_ms)
+            else:
+                self._data_tip_timer.stop()
+                self._data_tip_candidate = data_tip
+                self._data_tip_pinned = True
+                self._show_data_tip(data_tip)
+            return
+
+        if not self._data_tip_pinned:
+            self._hide_data_tip()
         self._pan_start = (event.x, event.y)
         self._pan_xlim = list(self.ax.get_xlim())
         self._pan_ylim = list(self.ax.get_ylim())
@@ -132,6 +160,149 @@ class MplCanvas(FigureCanvas):
                 dy_data = -dy_disp * (ylim[1] - ylim[0]) / bbox.height
                 self.ax.set_xlim(xlim[0] + dx_data, xlim[1] + dx_data)
                 self.ax.set_ylim(ylim[0] + dy_data, ylim[1] + dy_data)
+                self.draw_idle()
+            return
+
+        self._update_hover_data_tip(event)
+
+    def _on_axes_leave(self, _event):
+        if not self._data_tip_pinned:
+            self._data_tip_timer.stop()
+            self._data_tip_candidate = None
+            self._hide_data_tip()
+
+    def clear_data_tip(self):
+        """Forget the current data tip before plot artists are rebuilt."""
+        self._data_tip_timer.stop()
+        self._data_tip_candidate = None
+        self._data_tip_annotation = None
+        self._data_tip_pinned = False
+
+    def _update_hover_data_tip(self, event):
+        if self._data_tip_pinned:
+            return
+        candidate = self._nearest_data_tip(event)
+        if candidate is None:
+            self._data_tip_timer.stop()
+            self._data_tip_candidate = None
+            self._hide_data_tip()
+            return
+
+        previous = self._data_tip_candidate
+        same_line = previous is not None and previous.get("line") is candidate.get("line")
+        self._data_tip_candidate = candidate
+        if self._data_tip_annotation is not None and same_line:
+            self._show_data_tip(candidate)
+        elif not same_line:
+            self._hide_data_tip()
+            self._data_tip_timer.start(self._data_tip_delay_ms)
+        elif not self._data_tip_timer.isActive():
+            self._data_tip_timer.start(self._data_tip_delay_ms)
+
+    def _nearest_data_tip(self, event) -> dict | None:
+        if event.inaxes != self.ax or event.x is None or event.y is None:
+            return None
+        mouse = np.array([float(event.x), float(event.y)], dtype=float)
+        best: dict | None = None
+        best_distance_sq = self._data_tip_pick_radius_px ** 2
+
+        for line in self.ax.lines:
+            if not line.get_visible() or str(line.get_label()).startswith("_"):
+                continue
+            try:
+                x = np.asarray(line.get_xdata(orig=False), dtype=float).reshape(-1)
+                y = np.asarray(line.get_ydata(orig=False), dtype=float).reshape(-1)
+            except (TypeError, ValueError):
+                continue
+            n = min(x.size, y.size)
+            if n == 0:
+                continue
+            x = x[:n]
+            y = y[:n]
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not np.any(finite):
+                continue
+            x = x[finite]
+            y = y[finite]
+            display = line.get_transform().transform(np.column_stack((x, y)))
+
+            linestyle = str(line.get_linestyle()).lower()
+            is_continuous = linestyle not in ("none", "", " ") and x.size >= 2
+            if is_continuous:
+                starts = display[:-1]
+                vectors = display[1:] - starts
+                lengths_sq = np.einsum("ij,ij->i", vectors, vectors)
+                projection = np.zeros(vectors.shape[0], dtype=float)
+                valid_segments = lengths_sq > 0.0
+                if np.any(valid_segments):
+                    offsets = mouse - starts[valid_segments]
+                    projection[valid_segments] = np.clip(
+                        np.einsum("ij,ij->i", offsets, vectors[valid_segments])
+                        / lengths_sq[valid_segments],
+                        0.0,
+                        1.0,
+                    )
+                closest = starts + projection[:, None] * vectors
+                distances_sq = np.sum((closest - mouse) ** 2, axis=1)
+                index = int(np.argmin(distances_sq))
+                distance_sq = float(distances_sq[index])
+                fraction = float(projection[index])
+                x_value = float(x[index] + fraction * (x[index + 1] - x[index]))
+                y_value = float(y[index] + fraction * (y[index + 1] - y[index]))
+            else:
+                distances_sq = np.sum((display - mouse) ** 2, axis=1)
+                index = int(np.argmin(distances_sq))
+                distance_sq = float(distances_sq[index])
+                x_value = float(x[index])
+                y_value = float(y[index])
+
+            if distance_sq <= best_distance_sq:
+                best_distance_sq = distance_sq
+                best = {"line": line, "x": x_value, "y": y_value}
+        return best
+
+    def _show_pending_data_tip(self):
+        if not self._data_tip_pinned and self._data_tip_candidate is not None:
+            self._show_data_tip(self._data_tip_candidate)
+
+    def _show_data_tip(self, candidate: dict):
+        self._hide_data_tip(draw=False)
+        x = float(candidate["x"])
+        y = float(candidate["y"])
+        x_label = self.ax.get_xlabel().strip() or "x"
+        y_label = self.ax.get_ylabel().strip() or "y"
+        x_name = x_label.split(" (")[0]
+        y_name = y_label.split(" (")[0]
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        x_fraction = (x - xlim[0]) / (xlim[1] - xlim[0]) if xlim[1] != xlim[0] else 0.5
+        y_fraction = (y - ylim[0]) / (ylim[1] - ylim[0]) if ylim[1] != ylim[0] else 0.5
+        x_offset = -10 if x_fraction > 0.72 else 10
+        y_offset = -10 if y_fraction > 0.72 else 10
+        self._data_tip_annotation = self.ax.annotate(
+            f"{x_name} = {x:.6g}\n{y_name} = {y:.6g}",
+            xy=(x, y),
+            xytext=(x_offset, y_offset),
+            textcoords="offset points",
+            ha="right" if x_offset < 0 else "left",
+            va="top" if y_offset < 0 else "bottom",
+            fontsize=9,
+            color="black",
+            bbox={"boxstyle": "round,pad=0.3", "fc": "white", "ec": "#555555", "alpha": 0.92},
+            arrowprops={"arrowstyle": "-", "color": "#555555", "linewidth": 0.8},
+            zorder=20,
+        )
+        self.draw_idle()
+
+    def _hide_data_tip(self, *, draw: bool = True):
+        annotation = self._data_tip_annotation
+        self._data_tip_annotation = None
+        if annotation is not None:
+            try:
+                annotation.remove()
+            except (ValueError, AttributeError):
+                pass
+            if draw:
                 self.draw_idle()
 
     def _update_fill_region(self):
@@ -236,6 +407,60 @@ class MplCanvas(FigureCanvas):
 
     # ---- zoom support -------------------------------------------------------
 
+    def capture_view_limits(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """Return the currently visible x/y limits."""
+        return tuple(self.ax.get_xlim()), tuple(self.ax.get_ylim())
+
+    def restore_view_limits(
+        self,
+        limits: tuple[tuple[float, float], tuple[float, float]] | None,
+    ):
+        """Restore an exact viewport after a redraw in the same coordinate mode."""
+        if limits is None:
+            return
+        xlim, ylim = limits
+        if all(np.isfinite(xlim)) and xlim[0] != xlim[1]:
+            self.ax.set_xlim(xlim)
+        if all(np.isfinite(ylim)) and ylim[0] != ylim[1]:
+            self.ax.set_ylim(ylim)
+        self.draw_idle()
+
+    def capture_relative_view(self) -> dict[str, tuple[float, float]] | None:
+        """Express the visible viewport relative to the current full data bounds."""
+        if self._data_xlim is None or self._data_ylim is None:
+            return None
+
+        def relative(view, full):
+            span = float(full[1] - full[0])
+            if not np.isfinite(span) or span == 0.0:
+                return (0.0, 1.0)
+            return (
+                float((view[0] - full[0]) / span),
+                float((view[1] - full[0]) / span),
+            )
+
+        return {
+            "x": relative(self.ax.get_xlim(), self._data_xlim),
+            "y": relative(self.ax.get_ylim(), self._data_ylim),
+        }
+
+    def restore_relative_view(self, view: dict[str, tuple[float, float]] | None):
+        """Apply a relative viewport to newly calculated full data bounds."""
+        if view is None or self._data_xlim is None or self._data_ylim is None:
+            return
+
+        def absolute(relative, full):
+            span = float(full[1] - full[0])
+            return (
+                float(full[0] + relative[0] * span),
+                float(full[0] + relative[1] * span),
+            )
+
+        self.restore_view_limits((
+            absolute(view["x"], self._data_xlim),
+            absolute(view["y"], self._data_ylim),
+        ))
+
     def set_data_bounds(self, xlim: tuple, ylim: tuple):
         """Store the full data bounds for zoom reference."""
         self._data_xlim = xlim
@@ -250,6 +475,12 @@ class MplCanvas(FigureCanvas):
         self.ax.set_xlim(x_left, x_left + x_range)
         self.draw_idle()
 
+    def set_x_view(self, left: float, right: float):
+        """Set the visible x-axis interval without changing full data bounds."""
+        if np.isfinite(left) and np.isfinite(right) and left != right:
+            self.ax.set_xlim(min(left, right), max(left, right))
+            self.draw_idle()
+
     def zoom_y(self, fraction: float):
         """Zoom y-axis anchored at the bottom edge (y_min stays fixed)."""
         if self._data_ylim is None:
@@ -258,6 +489,12 @@ class MplCanvas(FigureCanvas):
         y_range = (self._data_ylim[1] - self._data_ylim[0]) * max(0.01, fraction)
         self.ax.set_ylim(y_bottom, y_bottom + y_range)
         self.draw_idle()
+
+    def set_y_view(self, bottom: float, top: float):
+        """Set the visible y-axis interval without changing full data bounds."""
+        if np.isfinite(bottom) and np.isfinite(top) and bottom != top:
+            self.ax.set_ylim(min(bottom, top), max(bottom, top))
+            self.draw_idle()
 
     def reset_zoom(self):
         """Restore full data view."""

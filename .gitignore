@@ -36,6 +36,7 @@ paper/draft_JOSS_md.pdf
 paper/draft_JOSS_md.spl
 paper/draft_JOSS_md.synctex.gz
 paper/paper.bib
+paper/reference_chicken_breast.bib
 
 # Runtime settings (written by the app on first run)
 imr_gui/settings.json

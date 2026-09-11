@@ -553,6 +553,9 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
     R_nondim = X[:, 0]
     U_nondim = X[:, 1]
     P_nondim = X[:, 2]
+    Theta_sim = X[:, 3 : 3 + NT]
+    vapor_sim = X[:, 3 + NT : 3 + 2 * NT]
+    T_sim = ((A_star - 1 + np.sqrt(1 + 2 * A_star * Theta_sim)) / A_star) * inp.T_inf
 
     t_sim = t_nondim * tc
     R_sim = R_nondim * Rc
@@ -578,6 +581,10 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
         Rmax_sim=Rmax_sim,
         tc=float(tc),
         Uc=float(Uc),
+        y_grid=yk.astype(float),
+        Theta_sim=Theta_sim.astype(float),
+        T_sim=T_sim.astype(float),
+        vapor_concentration_sim=vapor_sim.astype(float),
         n_damaged=n_damaged,
     )
 
@@ -941,6 +948,9 @@ def _simulate_gmod1_standalone(inp: GMOD1Inputs) -> NhkvOutputs:
     R_nondim = X[:, 0]
     U_nondim = X[:, 1]
     P_nondim = X[:, 2]
+    Theta_sim = X[:, 3 : 3 + NT]
+    vapor_sim = X[:, 3 + NT : 3 + 2 * NT]
+    T_sim = ((A_star - 1 + np.sqrt(1 + 2 * A_star * Theta_sim)) / A_star) * inp.T_inf
 
     t_sim = t_nondim * tc
     R_sim = R_nondim * Rc
@@ -963,4 +973,8 @@ def _simulate_gmod1_standalone(inp: GMOD1Inputs) -> NhkvOutputs:
         Rmax_sim=Rmax_sim,
         tc=float(tc),
         Uc=float(Uc),
+        y_grid=yk.astype(float),
+        Theta_sim=Theta_sim.astype(float),
+        T_sim=T_sim.astype(float),
+        vapor_concentration_sim=vapor_sim.astype(float),
     )
