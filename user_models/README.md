@@ -28,6 +28,11 @@ Minimal JSON shape:
 }
 ```
 
+Set the optional top-level field `"owns_req": true` when the model defines a
+parameter named `Req`. The GUI then disables the separate `Req_sim` control and
+uses the model parameter for simulation, fitting, jobs, sweeps, and exports.
+`params_si["Req"]` and `context["Req"]` both contain the fitted radius in meters.
+
 ## Python Solver Module
 
 The Python file named in `solver_entrypoint` contains the actual simulation

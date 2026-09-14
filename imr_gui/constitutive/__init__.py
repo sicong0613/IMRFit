@@ -34,6 +34,7 @@ class ConstitutiveModel:
     parameters: List[ConstitutiveParameter]
     constants: dict  # non-fittable physics constants from JSON
     solver_entrypoint: str | None = None  # "module:function" for user plugins
+    owns_req: bool = False  # Req is supplied by this model's parameter panel
 
 
 def _model_from_json_data(data: dict) -> ConstitutiveModel:
@@ -77,6 +78,7 @@ def _model_from_json_data(data: dict) -> ConstitutiveModel:
         parameters=params,
         constants=constants,
         solver_entrypoint=data.get("solver_entrypoint"),
+        owns_req=bool(data.get("owns_req", False)),
     )
 
 
@@ -99,6 +101,10 @@ def load_nhkv_rmax_model() -> ConstitutiveModel:
     return _load_model_json("nhkv_rmax.json")
 
 
+def load_nhkv_req_model() -> ConstitutiveModel:
+    return _load_model_json("nhkv_req.json")
+
+
 def load_gmod1_model() -> ConstitutiveModel:
     return _load_model_json("gmod1.json")
 
@@ -109,6 +115,7 @@ def load_gmod2_model() -> ConstitutiveModel:
 
 BUILTIN_MODELS = {
     "NHKV": load_nhkv_model,
+    "NHKV (Req)": load_nhkv_req_model,
     "NHKV (Rmax)": load_nhkv_rmax_model,
     "GMOD1": load_gmod1_model,
     "GMOD2": load_gmod2_model,
@@ -163,7 +170,7 @@ AVAILABLE_MODELS = load_available_models()
 
 __all__ = [
     "UnitOption", "ConstitutiveParameter", "ConstitutiveModel",
-    "load_nhkv_model", "load_nhkv_rmax_model",
+    "load_nhkv_model", "load_nhkv_req_model", "load_nhkv_rmax_model",
     "load_gmod1_model", "load_gmod2_model",
     "BUILTIN_MODELS", "AVAILABLE_MODELS", "discover_user_models", "load_available_models",
 ]

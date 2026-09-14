@@ -24,7 +24,7 @@ try:
 except ImportError:
     _HAS_MAT73 = False
 from PySide6.QtCore import QByteArray, QEvent, QMimeData, QRect, Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QActionGroup, QColor, QImage, QPen, QValidator
+from PySide6.QtGui import QActionGroup, QColor, QIcon, QImage, QPen, QValidator
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -525,6 +525,7 @@ class _SimSpec:
     bubble_model: str = "Keller-Miksis"
     plugin_entrypoint: str = ""
     plugin_context: dict | None = None
+    req_from_params: bool = False
 
 
 @dataclass
@@ -537,21 +538,24 @@ def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
     """Module-level dispatch function — picklable for ProcessPoolExecutor workers."""
     key = spec.model_key
     bm = spec.bubble_model
-    if key == "NHKV":
+    req = float(params_si.get("Req", spec.Req)) if spec.req_from_params else float(spec.Req)
+    if not np.isfinite(req) or req <= 0.0:
+        raise ValueError("Req must be a positive finite value.")
+    if key in ("NHKV", "NHKV (Req)"):
         const_kw = {k: v for k, v in spec.const.items()
                     if k in NhkvInputs.__dataclass_fields__}
         return simulate_nhkv_lic(NhkvInputs(
             U0=params_si["U0"], G=params_si["G"], mu=params_si["mu"],
-            Req=spec.Req, tspan=tspan, NT=spec.NT,
+            Req=req, tspan=tspan, NT=spec.NT,
             P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
         ))
     elif key == "NHKV (Rmax)":
-        Rmax_exp = spec.Rmax_exp if spec.Rmax_exp > 0 else spec.Req
+        Rmax_exp = spec.Rmax_exp if spec.Rmax_exp > 0 else req
         const_kw = {k: v for k, v in spec.const.items()
                     if k in NhkvRmaxInputs.__dataclass_fields__}
         return simulate_nhkv_rmax_lic(NhkvRmaxInputs(
             G=params_si["G"], mu=params_si["mu"],
-            Req=spec.Req, Rmax_exp=Rmax_exp, tspan=tspan, NT=spec.NT,
+            Req=req, Rmax_exp=Rmax_exp, tspan=tspan, NT=spec.NT,
             P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
         ))
     elif key == "GMOD1":
@@ -565,7 +569,7 @@ def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
             beta=params_si.get("beta", 1.0),
             mu=params_si.get("mu", 0.226),
             lambda_Y=params_si.get("lambda_Y", 1.5),
-            Req=spec.Req, tspan=tspan, NT=spec.NT,
+            Req=req, tspan=tspan, NT=spec.NT,
             P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
         ))
     elif key == "GMOD2":
@@ -583,13 +587,13 @@ def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
             beta2=params_si.get("beta2", 1.0),
             mu=params_si.get("mu", 0.226),
             lambda_Y=params_si.get("lambda_Y", 1.5),
-            Req=spec.Req, tspan=tspan, NT=spec.NT,
+            Req=req, tspan=tspan, NT=spec.NT,
             P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
         ))
     if spec.plugin_entrypoint:
         ctx = dict(spec.plugin_context or {})
         ctx.update({
-            "Req": spec.Req,
+            "Req": req,
             "NT": spec.NT,
             "P_inf": spec.P_inf,
             "rho": spec.rho,
@@ -705,7 +709,7 @@ class FitWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    APP_TITLE = "IMRFit (beta 1.3)"
+    APP_TITLE = "IMRFit (beta 1.31)"
     CURVE_MARKER_OPTIONS = (
         ("None", "none", "No point marker"),
         ("●", "circle_filled", "Filled circle"),
@@ -982,7 +986,8 @@ class MainWindow(QMainWindow):
         row_req = QGridLayout()
         row_req.setContentsMargins(0, 0, 0, 0)
         row_req.setHorizontalSpacing(6)
-        row_req.addWidget(QLabel("Req_sim (um)"), 0, 0)
+        self.lbl_Req_sim = QLabel("Req_sim (um)")
+        row_req.addWidget(self.lbl_Req_sim, 0, 0)
         self.spin_Req_um = _NoWheelSpinBox()
         self.spin_Req_um.setRange(0.001, 1e6)
         self.spin_Req_um.setDecimals(6)
@@ -1887,7 +1892,57 @@ class MainWindow(QMainWindow):
         return float(self.spin_Req_um.value()) * 1e-6
 
     def _current_sim_R_eq_m(self) -> float:
-        return float(self.spin_Req_um.value()) * 1e-6
+        return self._effective_sim_req_m()
+
+    def _model_owns_req(self, model_key: str | None = None) -> bool:
+        model = self._get_model_definition(model_key)
+        return bool(model is not None and model.owns_req)
+
+    def _effective_sim_req_m(
+        self,
+        params_si: dict[str, float] | None = None,
+        model_key: str | None = None,
+    ) -> float:
+        if self._model_owns_req(model_key):
+            params = params_si if params_si is not None else self._get_param_si()
+            req = float(params.get("Req", np.nan))
+        else:
+            req = float(self.spin_Req_um.value()) * 1e-6
+        if not np.isfinite(req) or req <= 0.0:
+            raise ValueError("Req must be a positive finite value.")
+        return req
+
+    def _set_model_req_parameter(self, req_m: float):
+        if not self._model_owns_req():
+            return
+        row = self._param_rows.get("Req")
+        if row is None:
+            return
+        factor = self._get_unit_factor("Req")
+        if factor <= 0.0:
+            factor = 1.0
+        row["spin"].setValue(float(req_m) / factor)
+
+    def _sync_model_req_display(self):
+        if not self._model_owns_req() or "Req" not in self._param_rows:
+            return
+        req_um = self._effective_sim_req_m() * 1e6
+        self.spin_Req_um.blockSignals(True)
+        self.spin_Req_um.setValue(req_um)
+        self.spin_Req_um.blockSignals(False)
+
+    def _update_req_sim_control(self):
+        model_owns_req = self._model_owns_req()
+        self.spin_Req_um.setEnabled(not model_owns_req)
+        self.lbl_Req_sim.setEnabled(not model_owns_req)
+        if model_owns_req:
+            tooltip = "Req_sim is controlled by the Req row in the selected model's parameter panel."
+            self.spin_Req_um.setToolTip(tooltip)
+            self.lbl_Req_sim.setToolTip(tooltip)
+            self._sync_model_req_display()
+        else:
+            self.spin_Req_um.setToolTip("Equilibrium radius used by simulation and fitting.")
+            self.lbl_Req_sim.setToolTip("")
 
     def _manual_Rmax_m(self) -> float:
         if hasattr(self, "spin_Rmax_um"):
@@ -1934,6 +1989,7 @@ class MainWindow(QMainWindow):
         r_eq_um = float(r_eq_m) * 1e6
         if update_sim:
             self.spin_Req_um.setValue(r_eq_um)
+            self._set_model_req_parameter(float(r_eq_m))
         if hasattr(self, "spin_Req_exp_um"):
             self.spin_Req_exp_um.setValue(r_eq_um)
         self.state.R_eq = float(r_eq_m)
@@ -4027,6 +4083,9 @@ class MainWindow(QMainWindow):
                 model, inherited_params, old_model_key
             )
         self._apply_parameter_defaults(params_to_apply)
+        if model.owns_req and "Req" not in params_to_apply:
+            self._set_model_req_parameter(float(self.spin_Req_um.value()) * 1e-6)
+        self._update_req_sim_control()
         self._set_mode(self.state.mode)  # refresh fit-control visibility
         # GMOD models require much tighter ODE tolerances than NHKV.
         if model_key in ("GMOD1", "GMOD2"):
@@ -4169,6 +4228,8 @@ class MainWindow(QMainWindow):
             "cmb_scale": cmb_scale,
             "row_widget": fw,
         }
+        if p.name == "Req":
+            spin.valueChanged.connect(lambda _value: self._sync_model_req_display())
 
     # =====================================================================
     # mode switching
@@ -4377,7 +4438,7 @@ class MainWindow(QMainWindow):
         const = dict(self._model_constants)
         const["c_long"] = float(self.spin_c_long.value())
         const["gamma"] = float(self.spin_gamma.value())
-        Req = float(self.spin_Req_um.value()) * 1e-6
+        Req = self._effective_sim_req_m(params, key)
         tspan = float(self.spin_tspan_us.value()) * 1e-6
         NT = int(self.spin_NT.value())
         solver = self._get_solver_settings()
@@ -4397,7 +4458,7 @@ class MainWindow(QMainWindow):
                     const=const, solver=solver, Rmax_exp=Rmax_exp,
                 ),
             }
-        if key == "NHKV":
+        if key in ("NHKV", "NHKV (Req)"):
             const_kw = {k: v for k, v in const.items()
                         if k in NhkvInputs.__dataclass_fields__}
             return NhkvInputs(
@@ -4451,7 +4512,7 @@ class MainWindow(QMainWindow):
         key = self._get_active_model_key()
         if self._plugin_entrypoint_for_model(key):
             return _run_plugin_simulation
-        if key == "NHKV":
+        if key in ("NHKV", "NHKV (Req)"):
             return simulate_nhkv_lic
         if key == "NHKV (Rmax)":
             return simulate_nhkv_rmax_lic
@@ -4465,7 +4526,7 @@ class MainWindow(QMainWindow):
         const = dict(self._model_constants)
         const["c_long"] = float(self.spin_c_long.value())
         const["gamma"] = float(self.spin_gamma.value())
-        Req = float(self.spin_Req_um.value()) * 1e-6
+        Req = self._effective_sim_req_m(params_si, key)
         NT = int(self.spin_NT.value())
         solver = self._get_solver_settings()
         P_inf = float(self.spin_P_inf.value())
@@ -4480,7 +4541,7 @@ class MainWindow(QMainWindow):
                 const=const, solver=solver, Rmax_exp=Rmax_exp,
             )
             return _plugin_sim_call(_PluginSimSpec(plugin_entrypoint, ctx), params_si, tspan)
-        if key == "NHKV":
+        if key in ("NHKV", "NHKV (Req)"):
             const_kw = {k: v for k, v in const.items()
                         if k in NhkvInputs.__dataclass_fields__}
             inp = NhkvInputs(
@@ -4611,6 +4672,8 @@ class MainWindow(QMainWindow):
             fw["spin_ub"].setValue(ub_si / new_factor)
 
         row["unit_index"] = new_index
+        if param_name == "Req":
+            self._sync_model_req_display()
 
     # =====================================================================
     # view mode
@@ -6596,7 +6659,9 @@ class MainWindow(QMainWindow):
         if n_points < 3:
             return None, f"Fit window contains fewer than 3 points ({n_points})."
 
-        req_m = float(self.spin_Req_um.value()) * 1e-6
+        initial_values = self._get_param_si()
+        req_from_params = self._model_owns_req(model_key)
+        req_m = self._effective_sim_req_m(initial_values, model_key)
 
         return {
             "version": 1,
@@ -6614,10 +6679,11 @@ class MainWindow(QMainWindow):
                 "import_metadata": dict(exp_import_metadata or {}),
             },
             "model": model_key,
+            "req_from_params": req_from_params,
             "solver_entrypoint": self._plugin_entrypoint_for_model(model_key),
             "constants": dict(self._model_constants),
             "parameters": self._collect_parameter_defaults(),
-            "initial_values": self._get_param_si(),
+            "initial_values": initial_values,
             "fit_flags": dict(fit_flags),
             "scales": dict(scales),
             "bounds_si": dict(bounds_si),
@@ -6756,7 +6822,9 @@ class MainWindow(QMainWindow):
             return None, "Experiment data is empty or invalid."
 
         fit_flags, scales, bounds_si = self._collect_fit_setup()
-        req_m = float(self.spin_Req_um.value()) * 1e-6
+        initial_values = self._get_param_si()
+        req_from_params = self._model_owns_req(model_key)
+        req_m = self._effective_sim_req_m(initial_values, model_key)
         return {
             "version": 1,
             "type": "simulation",
@@ -6773,10 +6841,11 @@ class MainWindow(QMainWindow):
                 "import_metadata": dict(exp_import_metadata or {}),
             },
             "model": model_key,
+            "req_from_params": req_from_params,
             "solver_entrypoint": self._plugin_entrypoint_for_model(model_key),
             "constants": dict(self._model_constants),
             "parameters": self._collect_parameter_defaults(),
-            "initial_values": self._get_param_si(),
+            "initial_values": initial_values,
             "fit_flags": dict(fit_flags),
             "scales": dict(scales),
             "bounds_si": dict(bounds_si),
@@ -7055,7 +7124,10 @@ class MainWindow(QMainWindow):
         top.addWidget(help_btn)
         layout.addLayout(top)
 
-        sweep_rows = [("Req", "Req", "um", float(self.spin_Req_um.value()), True)]
+        req_is_model_param = self._model_owns_req()
+        sweep_rows = [] if req_is_model_param else [
+            ("Req", "Req", "um", float(self.spin_Req_um.value()), True)
+        ]
         for param in self._current_model.parameters:
             row_state = self._param_rows.get(param.name, {})
             unit_options = row_state.get("unit_options") or param.units or []
@@ -7146,16 +7218,21 @@ class MainWindow(QMainWindow):
         for sweep_name, values in sweeps.items():
             factor = self._get_unit_factor(sweep_name)
             for display_value in values:
-                req_um = float(base_display.get("Req", float(self.spin_Req_um.value())))
+                req_um = float(self.spin_Req_um.value())
                 params_si = {
                     name: value * self._get_unit_factor(name)
                     for name, value in base_display.items()
-                    if name != "Req"
+                    if name != "Req" or req_is_model_param
                 }
                 if sweep_name == "Req":
-                    req_um = float(display_value)
+                    if req_is_model_param:
+                        params_si["Req"] = float(display_value) * factor
+                    else:
+                        req_um = float(display_value)
                 else:
                     params_si[sweep_name] = float(display_value) * factor
+                if req_is_model_param:
+                    req_um = float(params_si["Req"]) * 1e6
 
                 job, error = self._build_sim_job_snapshot_from_data(
                     exp_t=self.state.exp_t,
@@ -7193,7 +7270,13 @@ class MainWindow(QMainWindow):
                 job["sweep"] = {
                     "parameter": sweep_name,
                     "value_display": float(display_value),
-                    "value_si": float(req_um * 1e-6) if sweep_name == "Req" else float(params_si[sweep_name]),
+                    "value_si": (
+                        float(params_si["Req"])
+                        if sweep_name == "Req" and req_is_model_param
+                        else float(req_um * 1e-6)
+                        if sweep_name == "Req"
+                        else float(params_si[sweep_name])
+                    ),
                     "base_values_si": dict(params_si),
                     "Req_um": float(req_um),
                 }
@@ -7336,8 +7419,9 @@ class MainWindow(QMainWindow):
         self._update_window_title()
 
         settings = job.get("experiment_settings", {})
-        if settings.get("Req_um") is not None:
+        if settings.get("Req_um") is not None and not self._model_owns_req(model_key):
             self.spin_Req_um.setValue(float(settings["Req_um"]))
+        self._sync_model_req_display()
         if settings.get("Rmax_um") is not None and hasattr(self, "spin_Rmax_um"):
             self.spin_Rmax_um.setValue(float(settings["Rmax_um"]))
         if settings.get("Rmax_auto") is not None and hasattr(self, "chk_Rmax_auto"):
@@ -7479,7 +7563,15 @@ class MainWindow(QMainWindow):
             "rel_tol": float(phys.get("rel_tol", 1e-8)),
             "abs_tol": float(phys.get("abs_tol", 1e-7)),
         }
-        req = float(exp_settings["Req_um"]) * 1e-6
+        params = dict(job.get("_runtime_initial_values", job.get("initial_values", {})))
+        req_from_params = bool(job.get("req_from_params", False)) or self._model_owns_req(job["model"])
+        req = (
+            float(params.get("Req", np.nan))
+            if req_from_params
+            else float(exp_settings["Req_um"]) * 1e-6
+        )
+        if not np.isfinite(req) or req <= 0.0:
+            raise ValueError("Req must be a positive finite value.")
         sim_spec = _SimSpec(
             model_key=job["model"],
             Req=req,
@@ -7504,8 +7596,8 @@ class MainWindow(QMainWindow):
                 "solver": job_solver,
                 "Rmax_exp": float(rmax_exp),
             },
+            req_from_params=req_from_params,
         )
-        params = dict(job.get("_runtime_initial_values", job.get("initial_values", {})))
         tspan = float(exp_settings["tspan_us"]) * 1e-6
         return sim_spec, tspan, params
 
@@ -7625,6 +7717,7 @@ class MainWindow(QMainWindow):
         legacy_layouts: dict[int, list[str]] = {
             2: ["G", "mu"],
             3: ["U0", "G", "mu"],
+            4: ["U0", "G", "mu", "Req"],
             7: ["U0", "GA", "alpha", "GB", "beta", "mu", "lambda_Y"],
             11: [
                 "U0", "GA1", "GA2", "alpha1", "alpha2",
@@ -7920,6 +8013,7 @@ class MainWindow(QMainWindow):
                 fit_flags.setdefault(name, fallback)
 
         req_m = self._none_if_nan(self._mat_to_float(mat, "Req", None))
+        req_exp_m = self._none_if_nan(self._mat_to_float(mat, "Req_exp", req_m))
         p_inf = self._none_if_nan(self._mat_to_float(mat, "P_inf", None))
         rho = self._none_if_nan(self._mat_to_float(mat, "rho", None))
         gamma = self._none_if_nan(self._mat_to_float(mat, "gamma", None))
@@ -8003,9 +8097,10 @@ class MainWindow(QMainWindow):
                 "R": np.array(R_exp, dtype=float).copy(),
                 "P_inf": p_inf,
                 "rho": rho,
-                "R_eq": req_m,
+                "R_eq": req_exp_m,
             },
             "model": model_key,
+            "req_from_params": self._model_owns_req(model_key),
             "solver_entrypoint": self._plugin_entrypoint_for_model(model_key) if model_key else "",
             "constants": {},
             "parameters": param_defaults,
@@ -8147,6 +8242,23 @@ class MainWindow(QMainWindow):
         if vapor is not None:
             export["vapor_concentration_sim"] = np.asarray(vapor, dtype=float)
 
+    def _job_effective_req_m(
+        self,
+        job: dict,
+        params_si: dict[str, float] | None = None,
+    ) -> float:
+        req_from_params = bool(job.get("req_from_params", False)) or self._model_owns_req(
+            job.get("model", "")
+        )
+        if req_from_params:
+            params = params_si or job.get("best_params") or job.get("initial_values", {})
+            req = float(params.get("Req", np.nan))
+        else:
+            req = float(job["experiment_settings"]["Req_um"]) * 1e-6
+        if not np.isfinite(req) or req <= 0.0:
+            raise ValueError("Req must be a positive finite value.")
+        return req
+
     def _build_job_sim_result_export(
         self,
         job: dict,
@@ -8167,7 +8279,8 @@ class MainWindow(QMainWindow):
         Rmax_exp = find_rmax_value(t_exp, R_exp) if t_exp.size and R_exp.size else np.nan
         P_inf = float(phys["P_inf"])
         rho = float(phys["rho"])
-        Req = float(exp_settings["Req_um"]) * 1e-6
+        params = dict(job.get("best_params", job.get("initial_values", {})))
+        Req = self._job_effective_req_m(job, params)
         Uc = float(np.sqrt(P_inf / rho)) if rho > 0 else 1.0
         tc = Req / Uc if Uc > 0 else 1.0
 
@@ -8191,6 +8304,7 @@ class MainWindow(QMainWindow):
             "rho": rho,
             "gamma": float(phys.get("gamma", np.nan)),
             "Req": Req,
+            "Req_exp": np.nan if self._none_if_nan(exp.get("R_eq")) is None else float(exp["R_eq"]),
             "model_key": job["model"],
             "job_type": job.get("type", "simulation"),
             "imr_result_kind": "simulation",
@@ -8219,7 +8333,6 @@ class MainWindow(QMainWindow):
             ("ub", "O"), ("scale", "O"), ("group", "O"),
         ])
         arr = np.empty((1, len(names)), dtype=dtype)
-        params = dict(job.get("best_params", job.get("initial_values", {})))
         for i, nm in enumerate(names):
             lb, ub = job.get("bounds_si", {}).get(nm, (np.nan, np.nan))
             arr[0, i]["name"] = np.array(nm, dtype=object)
@@ -8254,7 +8367,7 @@ class MainWindow(QMainWindow):
         Rmax_exp = find_rmax_value(t_exp, R_exp)
         P_inf = float(phys["P_inf"])
         rho = float(phys["rho"])
-        Req = float(exp_settings["Req_um"]) * 1e-6
+        Req = self._job_effective_req_m(job, res.best_params)
         Uc = float(np.sqrt(P_inf / rho)) if rho > 0 else 1.0
         tc = Req / Uc if Uc > 0 else 1.0
 
@@ -8278,6 +8391,7 @@ class MainWindow(QMainWindow):
             "rho": rho,
             "gamma": float(phys.get("gamma", np.nan)),
             "Req": Req,
+            "Req_exp": np.nan if self._none_if_nan(exp.get("R_eq")) is None else float(exp["R_eq"]),
             "model_key": job["model"],
             "job_type": job.get("type", "fit"),
             "imr_result_kind": "fit",
@@ -8362,6 +8476,7 @@ class MainWindow(QMainWindow):
                 "R_eq": exp.get("R_eq"),
             },
             "model": job.get("model", ""),
+            "req_from_params": bool(job.get("req_from_params", False)),
             "solver_entrypoint": job.get("solver_entrypoint", ""),
             "constants": job.get("constants", {}),
             "parameters": job.get("parameters", {}),
@@ -8570,6 +8685,7 @@ class MainWindow(QMainWindow):
                 "R_eq": r_eq,
             },
             "model": meta.get("model", ""),
+            "req_from_params": bool(meta.get("req_from_params", False)),
             "solver_entrypoint": meta.get("solver_entrypoint", ""),
             "constants": dict(meta.get("constants", {}) or {}),
             "parameters": dict(meta.get("parameters", {}) or {}),
@@ -9180,7 +9296,7 @@ class MainWindow(QMainWindow):
                     R=out.R_sim,
                     legend=f"{model_key} simulation {len(self._view_curves) + 1}",
                     meta=self.state.sim_meta,
-                    R_eq=float(self.spin_Req_um.value()) * 1e-6,
+                    R_eq=self._current_sim_R_eq_m(),
                     P_inf=float(self.spin_P_inf.value()),
                     rho=float(self.spin_rho.value()),
                 )
@@ -9355,9 +9471,12 @@ class MainWindow(QMainWindow):
             return
 
         _rmax_exp = self._current_Rmax_exp_m()
+        model_key = self._get_active_model_key()
+        req_from_params = self._model_owns_req(model_key)
+        req_m = self._effective_sim_req_m(initial_values, model_key)
         sim_spec = _SimSpec(
-            model_key=self._get_active_model_key(),
-            Req=float(self.spin_Req_um.value()) * 1e-6,
+            model_key=model_key,
+            Req=req_m,
             NT=int(self.spin_NT.value()),
             P_inf=float(self.spin_P_inf.value()),
             rho=float(self.spin_rho.value()),
@@ -9365,10 +9484,10 @@ class MainWindow(QMainWindow):
             solver=self._get_solver_settings(),
             Rmax_exp=_rmax_exp,
             bubble_model=self._bubble_model,
-            plugin_entrypoint=self._plugin_entrypoint_for_model(self._get_active_model_key()),
+            plugin_entrypoint=self._plugin_entrypoint_for_model(model_key),
             plugin_context=self._plugin_context(
-                model_key=self._get_active_model_key(),
-                Req=float(self.spin_Req_um.value()) * 1e-6,
+                model_key=model_key,
+                Req=req_m,
                 NT=int(self.spin_NT.value()),
                 P_inf=float(self.spin_P_inf.value()),
                 rho=float(self.spin_rho.value()),
@@ -9376,6 +9495,7 @@ class MainWindow(QMainWindow):
                 solver=self._get_solver_settings(),
                 Rmax_exp=_rmax_exp,
             ),
+            req_from_params=req_from_params,
         )
         cfg = FitConfig(
             t_exp=t_windowed,
@@ -9455,6 +9575,7 @@ class MainWindow(QMainWindow):
                 row["spin"].blockSignals(True)
                 row["spin"].setValue(bp[name] / factor)
                 row["spin"].blockSignals(False)
+        self._sync_model_req_display()
 
         elapsed = ""
         if self._fit_start_time is not None:
@@ -9505,6 +9626,7 @@ class MainWindow(QMainWindow):
                 row["spin"].blockSignals(True)
                 row["spin"].setValue(bp[name] / factor)
                 row["spin"].blockSignals(False)
+        self._sync_model_req_display()
 
         if res.t_sim is not None and res.R_sim is not None:
             self.state.sim_t = res.t_sim
@@ -9641,7 +9763,7 @@ class MainWindow(QMainWindow):
                 Rmax_exp = find_rmax_value(t_exp, R_exp)
                 P_inf_gui = float(self.spin_P_inf.value())
                 rho_gui   = float(self.spin_rho.value())
-                R_eq_gui  = float(self.spin_Req_um.value()) * 1e-6
+                R_eq_gui  = self._current_sim_R_eq_m()
                 Uc_gui    = float(np.sqrt(P_inf_gui / rho_gui)) if rho_gui > 0 else 1.0
                 tc_gui    = R_eq_gui / Uc_gui if Uc_gui > 0 else 1.0
                 export["t_exp"]        = col(t_exp)
@@ -9693,7 +9815,8 @@ class MainWindow(QMainWindow):
             export["P_inf"]     = float(self.spin_P_inf.value())
             export["rho"]       = float(self.spin_rho.value())
             export["gamma"]     = float(self.spin_gamma.value())
-            export["Req"]       = float(self.spin_Req_um.value()) * 1e-6
+            export["Req"]       = self._current_sim_R_eq_m()
+            export["Req_exp"]   = self._current_R_eq_m()
             export["model_key"] = self._get_active_model_key()
             optimizer = asdict(self._opt_config)
             export["optimizer_json"] = json.dumps(self._json_safe(optimizer), ensure_ascii=False)
@@ -9759,6 +9882,7 @@ class MainWindow(QMainWindow):
                 _LAYOUTS: dict[int, list[str]] = {
                     2:  ["G", "mu"],                                        # NHKV (Rmax)
                     3:  ["U0", "G", "mu"],                                  # NHKV
+                    4:  ["U0", "G", "mu", "Req"],                           # NHKV (Req)
                     7:  ["U0", "GA", "alpha", "GB", "beta", "mu", "lambda_Y"],
                     11: ["U0", "GA1", "GA2", "alpha1", "alpha2",
                          "GB1", "GB2", "beta1", "beta2", "mu", "lambda_Y"],
@@ -9951,7 +10075,15 @@ class MainWindow(QMainWindow):
 
 
 def run():
+    if sys.platform == "win32":
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("IMRFit.IMRFit")
+
     app = QApplication([])
+    icon_path = Path(__file__).with_name("icon.ico")
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
     w = MainWindow()
     w.show()
     app.exec()

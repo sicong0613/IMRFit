@@ -1,6 +1,6 @@
 # IMRFit
 
-**Beta 1.3**
+**Beta 1.31**
 
 A Python desktop application for inertial microrheology (IMR) bubble simulation and parameter fitting, replacing the original MATLAB `patternsearch + IMR` workflow.
 
@@ -18,6 +18,8 @@ A Python desktop application for inertial microrheology (IMR) bubble simulation 
 
 - **Multiple constitutive models** — select at runtime via the Model menu:
   - **NHKV** — Neo-Hookean Kelvin-Voigt
+  - **NHKV (Req)** — NHKV with `U0`, `G`, `mu`, and simulation `Req` as fitting parameters
+  - **NHKV (Rmax)** — NHKV initialized at the measured peak radius with zero initial wall velocity
   - **GMOD1** — Generalized Maxwell-Ogden + Damage, 1-term (single elastic + single viscous branch)
   - **GMOD2** — Generalized Maxwell-Ogden + Damage, 2-term (two elastic + two viscous branches)
   - Models are defined in JSON files under `imr_gui/constitutive/` — adding a new model requires only a JSON descriptor and a solver function.
@@ -177,7 +179,7 @@ or:
 python -m imr_gui
 ```
 
-The main window title should read `IMRFit (beta 1.3)`.
+The main window title should read `IMRFit (beta 1.31)`.
 
 ---
 
@@ -307,6 +309,8 @@ imr_gui/
 ├── app.py                  # Main window, GUI logic
 ├── constitutive/
 │   ├── nhkv.json           # NHKV model descriptor
+│   ├── nhkv_req.json       # NHKV model with fitted Req
+│   ├── nhkv_rmax.json      # NHKV model initialized at Rmax
 │   ├── gmod1.json          # GMOD1 model descriptor
 │   ├── gmod.json           # GMOD2 model descriptor
 │   └── __init__.py         # Model registry (AVAILABLE_MODELS)
