@@ -51,7 +51,7 @@ class MplCanvas(FigureCanvas):
         self._data_tip_pick_radius_px = 14.0
         self._data_tip_candidate: dict | None = None
         self._data_tip_annotation = None
-        self._data_tip_pinned = False
+        self._data_tip_pins: list[dict] = []
         self._data_tip_timer = QTimer(self)
         self._data_tip_timer.setSingleShot(True)
         self._data_tip_timer.timeout.connect(self._show_pending_data_tip)
@@ -100,20 +100,18 @@ class MplCanvas(FigureCanvas):
         # Not near a fit line — start pan
         data_tip = self._nearest_data_tip(event)
         if data_tip is not None:
-            if self._data_tip_pinned:
-                self._data_tip_pinned = False
-                self._hide_data_tip()
-                self._data_tip_candidate = data_tip
-                self._data_tip_timer.start(self._data_tip_delay_ms)
+            pinned = self._matching_pinned_data_tip(data_tip)
+            self._data_tip_timer.stop()
+            self._hide_data_tip(draw=False)
+            self._data_tip_candidate = None
+            if pinned is not None:
+                self._remove_pinned_data_tip(pinned, draw=False)
             else:
-                self._data_tip_timer.stop()
-                self._data_tip_candidate = data_tip
-                self._data_tip_pinned = True
-                self._show_data_tip(data_tip)
+                self._pin_data_tip(data_tip, draw=False)
+            self.draw_idle()
             return
 
-        if not self._data_tip_pinned:
-            self._hide_data_tip()
+        self._hide_data_tip()
         self._pan_start = (event.x, event.y)
         self._pan_xlim = list(self.ax.get_xlim())
         self._pan_ylim = list(self.ax.get_ylim())
@@ -166,25 +164,82 @@ class MplCanvas(FigureCanvas):
         self._update_hover_data_tip(event)
 
     def _on_axes_leave(self, _event):
-        if not self._data_tip_pinned:
-            self._data_tip_timer.stop()
-            self._data_tip_candidate = None
-            self._hide_data_tip()
+        self._data_tip_timer.stop()
+        self._data_tip_candidate = None
+        self._hide_data_tip()
 
     def clear_data_tip(self):
-        """Forget the current data tip before plot artists are rebuilt."""
+        """Forget all data tips before plot artists are rebuilt."""
         self._data_tip_timer.stop()
         self._data_tip_candidate = None
         self._data_tip_annotation = None
-        self._data_tip_pinned = False
+        self._data_tip_pins.clear()
+
+    def capture_pinned_data_tips(self) -> list[dict]:
+        """Describe pinned tips so they can be restored after plot rebuilding."""
+        lines = list(self.ax.lines)
+        captured: list[dict] = []
+        for pinned in self._data_tip_pins:
+            line = pinned.get("line")
+            try:
+                line_index = lines.index(line)
+            except ValueError:
+                continue
+            label = str(line.get_label())
+            label_occurrence = sum(
+                1 for previous in lines[:line_index] if str(previous.get_label()) == label
+            )
+            captured.append({
+                "line_index": line_index,
+                "line_label": label,
+                "label_occurrence": label_occurrence,
+                "x": float(pinned["x"]),
+                "y": float(pinned["y"]),
+            })
+        return captured
+
+    def restore_pinned_data_tips(self, captured: list[dict] | None):
+        """Restore fixed tips onto the corresponding newly created line artists."""
+        if not captured:
+            return
+        lines = list(self.ax.lines)
+        restored = False
+        for saved in captured:
+            label = str(saved.get("line_label", ""))
+            line_index = int(saved.get("line_index", -1))
+            line = None
+            if 0 <= line_index < len(lines) and str(lines[line_index].get_label()) == label:
+                line = lines[line_index]
+            else:
+                matches = [candidate for candidate in lines if str(candidate.get_label()) == label]
+                occurrence = int(saved.get("label_occurrence", 0))
+                if 0 <= occurrence < len(matches):
+                    line = matches[occurrence]
+            if line is None or not line.get_visible():
+                continue
+            self._pin_data_tip(
+                {
+                    "line": line,
+                    "x": float(saved["x"]),
+                    "y": float(saved["y"]),
+                },
+                draw=False,
+            )
+            restored = True
+        if restored:
+            self.draw_idle()
 
     def _update_hover_data_tip(self, event):
-        if self._data_tip_pinned:
-            return
         candidate = self._nearest_data_tip(event)
         if candidate is None:
             self._data_tip_timer.stop()
             self._data_tip_candidate = None
+            self._hide_data_tip()
+            return
+
+        if self._matching_pinned_data_tip(candidate) is not None:
+            self._data_tip_timer.stop()
+            self._data_tip_candidate = candidate
             self._hide_data_tip()
             return
 
@@ -208,6 +263,10 @@ class MplCanvas(FigureCanvas):
 
         for line in self.ax.lines:
             if not line.get_visible() or str(line.get_label()).startswith("_"):
+                continue
+            if str(line.get_linestyle()).lower() in ("none", "", " ") and str(
+                line.get_marker()
+            ).lower() in ("none", "", " "):
                 continue
             try:
                 x = np.asarray(line.get_xdata(orig=False), dtype=float).reshape(-1)
@@ -262,11 +321,66 @@ class MplCanvas(FigureCanvas):
         return best
 
     def _show_pending_data_tip(self):
-        if not self._data_tip_pinned and self._data_tip_candidate is not None:
+        if (
+            self._data_tip_candidate is not None
+            and self._matching_pinned_data_tip(self._data_tip_candidate) is None
+        ):
             self._show_data_tip(self._data_tip_candidate)
 
     def _show_data_tip(self, candidate: dict):
         self._hide_data_tip(draw=False)
+        self._data_tip_annotation = self._create_data_tip_annotation(candidate)
+        self.draw_idle()
+
+    def _matching_pinned_data_tip(self, candidate: dict) -> dict | None:
+        line = candidate.get("line")
+        try:
+            candidate_display = line.get_transform().transform(
+                (float(candidate["x"]), float(candidate["y"]))
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+        tolerance_sq = self._data_tip_pick_radius_px ** 2
+        for pinned in self._data_tip_pins:
+            if pinned.get("line") is not line:
+                continue
+            try:
+                pinned_display = line.get_transform().transform(
+                    (float(pinned["x"]), float(pinned["y"]))
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if float(np.sum((candidate_display - pinned_display) ** 2)) <= tolerance_sq:
+                return pinned
+        return None
+
+    def _pin_data_tip(self, candidate: dict, *, draw: bool = True):
+        pinned = {
+            "line": candidate["line"],
+            "x": float(candidate["x"]),
+            "y": float(candidate["y"]),
+        }
+        pinned["annotation"] = self._create_data_tip_annotation(pinned)
+        self._data_tip_pins.append(pinned)
+        if draw:
+            self.draw_idle()
+
+    def _remove_pinned_data_tip(self, pinned: dict, *, draw: bool = True):
+        annotation = pinned.get("annotation")
+        if annotation is not None:
+            try:
+                annotation.remove()
+            except (ValueError, AttributeError):
+                pass
+        try:
+            self._data_tip_pins.remove(pinned)
+        except ValueError:
+            pass
+        if draw:
+            self.draw_idle()
+
+    def _create_data_tip_annotation(self, candidate: dict):
         x = float(candidate["x"])
         y = float(candidate["y"])
         x_label = self.ax.get_xlabel().strip() or "x"
@@ -279,7 +393,7 @@ class MplCanvas(FigureCanvas):
         y_fraction = (y - ylim[0]) / (ylim[1] - ylim[0]) if ylim[1] != ylim[0] else 0.5
         x_offset = -10 if x_fraction > 0.72 else 10
         y_offset = -10 if y_fraction > 0.72 else 10
-        self._data_tip_annotation = self.ax.annotate(
+        return self.ax.annotate(
             f"{x_name} = {x:.6g}\n{y_name} = {y:.6g}",
             xy=(x, y),
             xytext=(x_offset, y_offset),
@@ -292,7 +406,6 @@ class MplCanvas(FigureCanvas):
             arrowprops={"arrowstyle": "-", "color": "#555555", "linewidth": 0.8},
             zorder=20,
         )
-        self.draw_idle()
 
     def _hide_data_tip(self, *, draw: bool = True):
         annotation = self._data_tip_annotation
