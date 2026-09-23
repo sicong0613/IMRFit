@@ -1,8 +1,19 @@
 # IMRFit
 
-**Beta 1.31**
+**Beta 1.32**
 
 A Python desktop application for inertial microrheology (IMR) bubble simulation and parameter fitting, replacing the original MATLAB `patternsearch + IMR` workflow.
+
+---
+
+## Beta 1.32 highlights
+
+- Result MAT files now include explicit SI time/radius unit metadata and preserve available import calibration metadata. When these files are imported again, their declared units take priority over saved Import Wizard defaults.
+- File import/export dialogs share one persisted recent directory, including Import Wizard drag-and-drop, job queues, parameters, results, and Curve View files.
+- Curve View can save and restore editable views as MAT files, export/copy the live styled canvas, use independent markers and line styles, and apply `Distinct`, `Sweep gradient`, or `Same color` palettes.
+- Plot interaction includes two-ended zoom sliders and hover/click data tips. Pan and zoom are preserved during dimensional/normalized switching, while Curve View copy/export uses the live legends, styles, limits, and pinned coordinates.
+- Fitting simulations extend their integration span when needed to cover the fitting window. Up to three uncovered points at the left edge may be omitted; the right edge must be covered.
+- Simulation result exports include available internal gas-temperature and vapor-concentration histories.
 
 ---
 
@@ -44,9 +55,9 @@ A Python desktop application for inertial microrheology (IMR) bubble simulation 
 
 - **Unit display** — spinboxes support Pa / kPa / MPa for stiffness, µs/µm for time and radius.
 
-- **Plot controls** — zoom, time window, normalization toggle (R/Req), experimental data overlay.
+- **Plot controls** — two-ended zoom, draggable plot limits, data tips, fitting-window controls, and dimensional/normalized views. Display normalization uses each curve's own `Rmax`, with `R* = R/Rmax` and `t* = (t - t_Rmax) Uc/Rmax`.
 
-- **Curve View panel** - compare many imported experiment/simulation curves at once, edit legends, line widths, visibility, curve order, and batch-apply either high-contrast distinct colors or parameter-sweep gradient colors.
+- **Curve View panel** - compare many experiment/simulation curves at once; edit legends, markers, line styles, widths, visibility, and order; save/reload editable MAT views; and batch-apply distinct, sweep-gradient, or common colors.
 
 - **Auto ODE tolerance** — switching to GMOD1/GMOD2 automatically sets `rtol = atol = 1e-9` (required for accurate resolution of the stiff Maxwell branch); switching to NHKV uses `1e-8 / 1e-7`.
 
@@ -179,7 +190,7 @@ or:
 python -m imr_gui
 ```
 
-The main window title should read `IMRFit (beta 1.31)`.
+The main window title should read `IMRFit (beta 1.32)`.
 
 ---
 
@@ -206,9 +217,26 @@ Current tutorial topics include:
 
 ## Loading experimental data
 
-File → Load experiment data (.mat)
+Use either:
 
-Expects a `.mat` file with 1-D arrays named `t` (seconds) and `R` (meters). Falls back to positional detection if exact names are not found. Time is automatically shifted so that the interpolated R-peak sits at t = 0.
+```text
+File -> Load experiment data (.mat)
+File -> Import Wizard...
+```
+
+Standard import recognizes saved variable-name aliases and common time/radius names. If automatic recognition fails, IMRFit offers to open the Import Wizard for manual mapping.
+
+The Import Wizard supports:
+
+- manual mapping of experimental and simulated time-radius arrays, legends, fitted parameters, fit-window fields, and physical constants
+- `s`, `µs`, `m`, `µm`, and pixel radius inputs
+- pixel-to-µm calibration and reconstruction of a missing time axis from camera FPS
+- editable scalar previews, automatic `Req`/`Rmax` previews, and optional removal of negative radii or isolated spikes
+- learned variable names and saved calibration/cleanup defaults for standard, wizard, and batch imports
+
+When a MAT file declares `unit_system`, `time_unit`, or `radius_unit`, those file-level units take priority over learned defaults. The Import Wizard displays the declared units and warns before importing with a manual override.
+
+All file dialogs share the most recently used directory. The directory is saved in `settings.json` and restored the next time IMRFit starts.
 
 ---
 
@@ -228,7 +256,10 @@ The Curve View panel supports:
 - row selection with Ctrl/Shift multi-select
 - `Clear selected`, `Clear all`
 - `Move to top`, `Move up`, `Move down`
-- legend editing, type switching, color selection, and line-width editing
+- legend editing, independent point-marker and line-style selection, color selection, and line-width editing
+- filled/open circle, triangle, square, and hexagon markers, plus solid/dashed/no-line styles
+- automatic marker cycling for newly imported experimental curves
+- hover coordinates and independently pinned data-point labels
 
 Color assignment is explicit:
 
@@ -240,8 +271,11 @@ Available color modes:
 
 - `Distinct`: high-contrast colors for a small number of curves.
 - `Sweep gradient`: parameter-sweep colors, mapped by the current curve row order.
+- `Same color`: applies the color selected beside `Color mode` to every target curve.
 
 If rows are selected, `Apply colors` only recolors selected rows. If no rows are selected, it recolors all curves. This makes it possible to reorder curves first, then apply a sweep gradient in the desired parameter direction.
+
+The color menu follows the operating-system light/dark palette while keeping each swatch visible against the menu background.
 
 Color presets live in:
 
@@ -266,9 +300,26 @@ The default `view_colors.json` includes high-contrast distinct colors and a 20-c
 
 Curve View exports are under the `View` menu:
 
-- `Export view (.mat)`: exports curve data and style metadata.
+- `Import view (.mat)`: restores exported curves, styles, order, normalization mode, zoom, and plot limits for further editing.
+- `Export view (.mat)`: exports curve data, style metadata, and view state.
 - `Export view (.svg)`: exports a vector figure.
 - `Copy view (png)` / `Copy view (svg)`: copies the current preview to the clipboard.
+
+Opening the Curve Selection Panel synchronizes any curves already visible on the canvas. When multiple-curve selection is enabled, newly imported curves are appended instead of clearing the existing view.
+
+---
+
+## Result MAT files
+
+Individual and Job List result files use SI internally and declare:
+
+```text
+unit_system = SI
+time_unit = s
+radius_unit = m
+```
+
+Available import provenance is stored in `struct_import`, including recognized variable names, FPS, and pixel-to-µm calibration. Solver outputs may also include `T_sim` (K) and `vapor_concentration_sim` when the selected model provides them.
 
 ---
 

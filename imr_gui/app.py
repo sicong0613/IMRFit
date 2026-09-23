@@ -24,7 +24,7 @@ try:
 except ImportError:
     _HAS_MAT73 = False
 from PySide6.QtCore import QByteArray, QEvent, QMimeData, QRect, Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QActionGroup, QColor, QIcon, QImage, QPen, QValidator
+from PySide6.QtGui import QActionGroup, QColor, QIcon, QImage, QPalette, QPen, QValidator
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -457,7 +457,8 @@ class _ColorSwatchDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):  # noqa: N802
         data = index.data(Qt.ItemDataRole.UserRole)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        background = QColor("#d9eaf7") if selected else QColor("#ffffff")
+        background_role = QPalette.ColorRole.AlternateBase if selected else QPalette.ColorRole.Base
+        background = option.palette.color(background_role)
         painter.save()
         painter.fillRect(option.rect, background)
         if data == "__more__":
@@ -471,7 +472,7 @@ class _ColorSwatchDelegate(QStyledItemDelegate):
             return
         rect = option.rect.adjusted(4, 3, -4, -3)
         painter.fillRect(rect, color)
-        painter.setPen(QPen(QColor("#000000"), 1))
+        painter.setPen(QPen(option.palette.color(QPalette.ColorRole.Text), 1))
         painter.drawRect(rect)
         painter.restore()
 
@@ -712,7 +713,7 @@ class FitWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    APP_TITLE = "IMRFit (beta 1.31)"
+    APP_TITLE = "IMRFit (beta 1.32)"
     CURVE_MARKER_OPTIONS = (
         ("None", "none", "No point marker"),
         ("●", "circle_filled", "Filled circle"),
@@ -1693,9 +1694,6 @@ class MainWindow(QMainWindow):
             if QColor(preset["color"]).name().lower() == QColor(color).name().lower():
                 selected_index = i
         combo.addItem("More colors...", "__more__")
-        more_index = combo.count() - 1
-        combo.setItemData(more_index, QColor("#ffffff"), Qt.ItemDataRole.BackgroundRole)
-        combo.setItemData(more_index, QColor("#000000"), Qt.ItemDataRole.ForegroundRole)
         if selected_index < 0 and QColor(color).isValid():
             insert_at = max(0, combo.count() - 1)
             custom = QColor(color).name()
@@ -1739,12 +1737,12 @@ class MainWindow(QMainWindow):
             " width: 14px;"
             "}"
             "QComboBox QAbstractItemView {"
-            " background-color: #ffffff;"
-            " color: #000000;"
-            " border: 2px solid #000;"
+            " background-color: palette(base);"
+            " color: palette(text);"
+            " border: 2px solid palette(window);"
             " outline: 0;"
-            " selection-background-color: #d9eaf7;"
-            " selection-color: #000000;"
+            " selection-background-color: palette(alternate-base);"
+            " selection-color: palette(text);"
             "}"
             "QComboBox:disabled {"
             " background-color: #252525;"
