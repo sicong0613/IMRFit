@@ -456,16 +456,19 @@ class _ColumnResizeHandle(QFrame):
 class _ColorSwatchDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):  # noqa: N802
         data = index.data(Qt.ItemDataRole.UserRole)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        background = QColor("#d9eaf7") if selected else QColor("#ffffff")
+        painter.save()
+        painter.fillRect(option.rect, background)
         if data == "__more__":
+            painter.restore()
             super().paint(painter, option, index)
             return
         color = QColor(str(data))
         if not color.isValid():
+            painter.restore()
             super().paint(painter, option, index)
             return
-        painter.save()
-        if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(option.rect, option.palette.highlight())
         rect = option.rect.adjusted(4, 3, -4, -3)
         painter.fillRect(rect, color)
         painter.setPen(QPen(QColor("#000000"), 1))
@@ -807,6 +810,7 @@ class MainWindow(QMainWindow):
         self._job_success_threshold_enabled: bool = True
         self._job_success_lsqerr: float = 10.0
         self._job_output_dir: str = ""
+        self._last_file_directory: str = ""
         self._job_ask_output_dir: bool = True
         self._job_chain_best_fit_initial: bool = False
         self._job_parallel_workers: int = 1
@@ -830,6 +834,7 @@ class MainWindow(QMainWindow):
         self._view_curves: list[dict] = []
         self._view_color_presets: list[dict] = self._load_view_color_presets()
         self._curve_color_mode: str = "distinct"
+        self._same_curve_color: str = "#1f77b4"
         self._selected_curve_indices: set[int] = set()
         self._curve_selection_anchor: int | None = None
         self._warned_curve_view_multi_exp_req: bool = False
@@ -1275,6 +1280,7 @@ class MainWindow(QMainWindow):
         default = [
             {"name": "Blue", "color": "#1f77b4", "role": "sim", "palette": "distinct"},
             {"name": "Orange", "color": "#ff7f0e", "role": "sim", "palette": "distinct"},
+            {"name": "Black", "color": "#000000", "role": "exp", "palette": "distinct"},
             {"name": "Green", "color": "#2ca02c", "role": "exp", "palette": "distinct"},
             {"name": "Red", "color": "#d62728", "role": "exp", "palette": "distinct"},
             {"name": "Purple", "color": "#9467bd", "role": "sim", "palette": "distinct"},
@@ -1283,7 +1289,6 @@ class MainWindow(QMainWindow):
             {"name": "Gray", "color": "#7f7f7f", "role": "exp", "palette": "distinct"},
             {"name": "Olive", "color": "#bcbd22", "role": "sim", "palette": "distinct"},
             {"name": "Cyan", "color": "#17becf", "role": "sim", "palette": "distinct"},
-            {"name": "Black", "color": "#000000", "role": "exp", "palette": "distinct"},
         ]
         path = self._view_colors_path()
         if not path.exists():
@@ -1345,11 +1350,18 @@ class MainWindow(QMainWindow):
         self.cmb_curve_color_mode = _NoWheelComboBox()
         self.cmb_curve_color_mode.addItem("Distinct", "distinct")
         self.cmb_curve_color_mode.addItem("Sweep gradient", "sweep")
+        self.cmb_curve_color_mode.addItem("Same color", "same")
         self.cmb_curve_color_mode.setToolTip(
-            "Distinct uses high-contrast colors. Sweep gradient maps curve order to a parameter-sweep color ramp."
+            "Distinct uses high-contrast colors. Sweep gradient maps curve order to a parameter-sweep color ramp. "
+            "Same color applies the selected color to every target curve."
         )
         self.cmb_curve_color_mode.currentIndexChanged.connect(self._on_curve_color_mode_changed)
         color_row.addWidget(self.cmb_curve_color_mode)
+        self.cmb_same_curve_color = self._make_curve_color_combo(self._same_curve_color, "simulation")
+        self.cmb_same_curve_color.setFixedWidth(72)
+        self.cmb_same_curve_color.setToolTip("Color used by Same color mode.")
+        self.cmb_same_curve_color.currentIndexChanged.connect(self._on_same_curve_color_changed)
+        color_row.addWidget(self.cmb_same_curve_color)
         self.btn_apply_curve_colors = QPushButton("Apply colors")
         self.btn_apply_curve_colors.setToolTip(
             "Apply the selected color mode to selected curves, or to all curves if no rows are selected."
@@ -1358,6 +1370,7 @@ class MainWindow(QMainWindow):
         color_row.addWidget(self.btn_apply_curve_colors)
         color_row.addStretch(1)
         lay.addLayout(color_row)
+        self._update_same_curve_color_control()
 
         self._curve_col_widths = {0: 28, 1: 58, 2: 68, 3: 112, 4: 62, 5: 78}
         self._curve_col_min_widths = {0: 28, 1: 36, 2: 44, 3: 64, 4: 28, 5: 35}
@@ -1441,15 +1454,54 @@ class MainWindow(QMainWindow):
     def _on_curve_color_mode_changed(self, _index: int):
         if hasattr(self, "cmb_curve_color_mode"):
             self._curve_color_mode = str(self.cmb_curve_color_mode.currentData() or "distinct")
+        self._update_same_curve_color_control()
+
+    def _update_same_curve_color_control(self):
+        if hasattr(self, "cmb_same_curve_color"):
+            enabled = str(getattr(self, "_curve_color_mode", "distinct")) == "same"
+            self.cmb_same_curve_color.setEnabled(enabled)
+
+    def _set_curve_color_combo_color(self, combo: QComboBox, color: str):
+        chosen = QColor(str(color))
+        if not chosen.isValid():
+            return
+        normalized = chosen.name()
+        target_index = -1
+        for index in range(combo.count()):
+            data = combo.itemData(index)
+            if data != "__more__" and QColor(str(data)).isValid() and QColor(str(data)).name() == normalized:
+                target_index = index
+                break
+        if target_index < 0:
+            target_index = max(0, combo.count() - 1)
+            combo.insertItem(target_index, normalized.upper(), normalized)
+            combo.setItemData(target_index, chosen, Qt.ItemDataRole.BackgroundRole)
+            combo.setItemData(target_index, QColor("#000000"), Qt.ItemDataRole.ForegroundRole)
+            combo.setItemData(target_index, "Current custom color", Qt.ItemDataRole.ToolTipRole)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(target_index)
+        combo.blockSignals(False)
+        self._refresh_curve_color_combo(combo)
+
+    def _on_same_curve_color_changed(self, index: int):
+        combo = self.cmb_same_curve_color
+        data = combo.itemData(index)
+        if data == "__more__":
+            initial = QColor(str(getattr(self, "_same_curve_color", "#1f77b4")))
+            chosen = QColorDialog.getColor(initial, self, "Select common curve color")
+            if chosen.isValid():
+                self._same_curve_color = chosen.name()
+            self._set_curve_color_combo_color(combo, self._same_curve_color)
+            return
+        chosen = QColor(str(data))
+        if chosen.isValid():
+            self._same_curve_color = chosen.name()
+        self._refresh_curve_color_combo(combo)
 
     def _curve_view_active(self) -> bool:
         return (
             bool(getattr(self, "_force_curve_view_render", False))
-            or (
-                bool(getattr(self, "_multi_curve_enabled", False))
-                and hasattr(self, "_curve_view_dock")
-                and self._curve_view_dock.isVisible()
-            )
+            or bool(getattr(self, "_multi_curve_enabled", False))
         )
 
     def _curve_collection_enabled(self) -> bool:
@@ -1641,6 +1693,9 @@ class MainWindow(QMainWindow):
             if QColor(preset["color"]).name().lower() == QColor(color).name().lower():
                 selected_index = i
         combo.addItem("More colors...", "__more__")
+        more_index = combo.count() - 1
+        combo.setItemData(more_index, QColor("#ffffff"), Qt.ItemDataRole.BackgroundRole)
+        combo.setItemData(more_index, QColor("#000000"), Qt.ItemDataRole.ForegroundRole)
         if selected_index < 0 and QColor(color).isValid():
             insert_at = max(0, combo.count() - 1)
             custom = QColor(color).name()
@@ -1656,30 +1711,52 @@ class MainWindow(QMainWindow):
 
     def _refresh_curve_color_combo(self, combo: QComboBox):
         data = combo.currentData()
-        if data == "__more__":
-            combo.setStyleSheet("")
-            return
         color = QColor(str(data))
-        if not color.isValid():
-            combo.setStyleSheet("")
-            return
+        if color.isValid() and data != "__more__":
+            field_style = (
+                "QComboBox {"
+                f" background-color: {color.name()};"
+                " color: transparent;"
+                " border: 2px solid #000;"
+                " padding: 0 14px 0 2px;"
+                " selection-background-color: transparent;"
+                "}"
+            )
+        else:
+            field_style = (
+                "QComboBox {"
+                " background-color: #ffffff;"
+                " color: #000000;"
+                " border: 2px solid #000;"
+                " padding: 0 14px 0 4px;"
+                "}"
+            )
         combo.setStyleSheet(
-            "QComboBox {"
-            f" background-color: {color.name()};"
-            " color: transparent;"
-            " border: 2px solid #000;"
-            " padding: 0 14px 0 2px;"
-            " selection-background-color: transparent;"
-            "}"
-            "QComboBox::drop-down {"
+            field_style
+            + "QComboBox::drop-down {"
             " border-left: 1px solid #000;"
-            " background: rgba(255, 255, 255, 35);"
+            " background: #ffffff;"
             " width: 14px;"
             "}"
             "QComboBox QAbstractItemView {"
-            " border: 1px solid #000;"
+            " background-color: #ffffff;"
+            " color: #000000;"
+            " border: 2px solid #000;"
             " outline: 0;"
-            " selection-background-color: rgba(255, 255, 255, 45);"
+            " selection-background-color: #d9eaf7;"
+            " selection-color: #000000;"
+            "}"
+            "QComboBox:disabled {"
+            " background-color: #252525;"
+            " color: transparent;"
+            " border: 1px solid #343434;"
+            "}"
+            "QComboBox::drop-down:disabled {"
+            " background-color: #252525;"
+            " border-left: 1px solid #343434;"
+            "}"
+            "QComboBox::down-arrow:disabled {"
+            " image: none;"
             "}"
         )
 
@@ -1780,6 +1857,10 @@ class MainWindow(QMainWindow):
     def _colors_for_curve_targets(self, target_indices: list[int], palette: str) -> list[str]:
         if not target_indices:
             return []
+        if palette == "same":
+            color = QColor(str(getattr(self, "_same_curve_color", "#1f77b4")))
+            common = color.name() if color.isValid() else "#1f77b4"
+            return [common] * len(target_indices)
         if palette == "sweep":
             presets = self._ordered_view_color_presets("simulation", palette="sweep")
             stops = [str(p.get("color", "#1f77b4")) for p in presets]
@@ -1810,8 +1891,13 @@ class MainWindow(QMainWindow):
         for idx, color in zip(targets, colors):
             self._view_curves[idx]["color"] = color
         self._rebuild_curve_rows()
+        mode_label = {
+            "distinct": "distinct",
+            "sweep": "sweep gradient",
+            "same": "same",
+        }.get(palette, palette)
         self.statusBar().showMessage(
-            f"Applied {'sweep gradient' if palette == 'sweep' else 'distinct'} colors to {len(targets)} curve(s)."
+            f"Applied {mode_label} colors to {len(targets)} curve(s)."
         )
 
     @staticmethod
@@ -2535,11 +2621,12 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Batch import curves",
-            "",
+            self._file_dialog_start(),
             "MAT files (*.mat)",
         )
         if not paths:
             return
+        self._remember_file_dialog_path(paths[0])
         if not self._curve_view_dock.isVisible():
             self._curve_view_dock.setFloating(True)
             self._curve_view_dock.show()
@@ -2550,16 +2637,37 @@ class MainWindow(QMainWindow):
         for path in paths:
             try:
                 mat = loadmat(path, squeeze_me=True, struct_as_record=False)
+                declared_units = self._declared_mat_units(mat)
                 base_legend = self._curve_legend_from_mat(mat, Path(path).stem)
                 curve_R_eq = self._mat_to_float(mat, "R_eq", None)
                 if curve_R_eq is None:
                     curve_R_eq = self._mat_to_float(mat, "Req", None)
+                if curve_R_eq is not None and "Req" in declared_units:
+                    curve_R_eq = float(np.asarray(
+                        self._import_unit_to_si("Req", curve_R_eq, declared_units["Req"])
+                    ).reshape(-1)[0])
                 curve_P_inf = self._mat_to_float(mat, "P_inf", None)
                 curve_rho = self._mat_to_float(mat, "rho", None)
                 t_sim = self._mat_array(mat, "t_sim")
                 R_sim = self._mat_array(mat, "R_sim")
                 t_exp = self._mat_array(mat, "t_exp")
                 R_exp = self._mat_array(mat, "R_exp")
+                for name, array in (
+                    ("t_sim", t_sim), ("R_sim", R_sim),
+                    ("t_exp", t_exp), ("R_exp", R_exp),
+                ):
+                    if name in declared_units:
+                        converted = np.asarray(
+                            self._import_unit_to_si(name, array, declared_units[name]), dtype=float
+                        ).reshape(-1)
+                        if name == "t_sim":
+                            t_sim = converted
+                        elif name == "R_sim":
+                            R_sim = converted
+                        elif name == "t_exp":
+                            t_exp = converted
+                        else:
+                            R_exp = converted
                 has_exp_curve = t_exp.size >= 3 and R_exp.size >= 3
                 has_sim_curve = t_sim.size >= 3 and R_sim.size >= 3
                 if t_exp.size >= 3 and R_exp.size >= 3:
@@ -2575,10 +2683,22 @@ class MainWindow(QMainWindow):
                     )
                     added += 1
                 if t_sim.size >= 3 and R_sim.size >= 3:
+                    curve_rmax = self._mat_to_float(mat, "Rmax_sim", None)
+                    if curve_rmax is None:
+                        curve_rmax = float(np.nanmax(R_sim))
+                    elif "Rmax" in declared_units:
+                        curve_rmax = float(np.asarray(self._import_unit_to_si(
+                            "Rmax", curve_rmax, declared_units["Rmax"]
+                        )).reshape(-1)[0])
+                    curve_tc = self._mat_to_float(mat, "tc", 1.0)
+                    if "t_sim" in declared_units and "tc" in mat:
+                        curve_tc = float(np.asarray(self._import_unit_to_si(
+                            "t_sim", curve_tc, declared_units["t_sim"]
+                        )).reshape(-1)[0])
                     meta = {
-                        "Rmax": self._mat_to_float(mat, "Rmax_sim", float(np.nanmax(R_sim))),
+                        "Rmax": curve_rmax,
                         "t_rmax": 0.0,
-                        "tc": self._mat_to_float(mat, "tc", 1.0),
+                        "tc": curve_tc,
                     }
                     self._add_curve_to_view(
                         curve_type="simulation",
@@ -2621,7 +2741,14 @@ class MainWindow(QMainWindow):
                 f"Imported {added} curve(s), skipped {len(skipped)} file(s).\n\n{detail}",
             )
 
+    def _ensure_view_curves_for_output(self) -> bool:
+        """Populate an empty Curve View from the current preview on demand."""
+        if not self._view_curves:
+            self._seed_view_curves_from_current_canvas()
+        return bool(self._view_curves)
+
     def _view_export_curves(self) -> list[dict]:
+        self._ensure_view_curves_for_output()
         self._sync_curve_view_controls()
         return list(self._view_curves)
 
@@ -2730,6 +2857,7 @@ class MainWindow(QMainWindow):
 
     def _load_curve_view_mat(self, path: str) -> tuple[list[dict], dict]:
         mat = loadmat(path, squeeze_me=True, struct_as_record=False)
+        declared_units = self._declared_mat_units(mat)
         format_name = self._mat_to_string(mat, "imr_view_format", "").strip()
         if format_name != "IMRFit curve view":
             raise ValueError("This MAT file is not an IMRFit Curve View export.")
@@ -2760,6 +2888,14 @@ class MainWindow(QMainWindow):
         for index in range(count):
             t_arr = np.asarray(t_items[index], dtype=float).reshape(-1)
             r_arr = np.asarray(r_items[index], dtype=float).reshape(-1)
+            if "t_exp" in declared_units:
+                t_arr = np.asarray(
+                    self._import_unit_to_si("t_exp", t_arr, declared_units["t_exp"]), dtype=float
+                ).reshape(-1)
+            if "R_exp" in declared_units:
+                r_arr = np.asarray(
+                    self._import_unit_to_si("R_exp", r_arr, declared_units["R_exp"]), dtype=float
+                ).reshape(-1)
             n = min(t_arr.size, r_arr.size)
             if n <= 0:
                 raise ValueError(f"Curve {index + 1} contains no time-radius data.")
@@ -2789,6 +2925,14 @@ class MainWindow(QMainWindow):
                         meta = decoded
                 except (TypeError, ValueError, json.JSONDecodeError):
                     meta = {}
+            if "Rmax" in meta and "Rmax" in declared_units:
+                meta["Rmax"] = float(np.asarray(self._import_unit_to_si(
+                    "Rmax", meta["Rmax"], declared_units["Rmax"]
+                )).reshape(-1)[0])
+            if "t_rmax" in meta and "t_sim" in declared_units:
+                meta["t_rmax"] = float(np.asarray(self._import_unit_to_si(
+                    "t_sim", meta["t_rmax"], declared_units["t_sim"]
+                )).reshape(-1)[0])
             if curve_type == "simulation" and not meta:
                 rmax_index = int(np.nanargmax(r_arr))
                 meta = {"Rmax": float(r_arr[rmax_index]), "t_rmax": float(t_arr[rmax_index])}
@@ -2804,7 +2948,11 @@ class MainWindow(QMainWindow):
                 "t": t_arr.copy(),
                 "R": r_arr.copy(),
                 "meta": meta,
-                "R_eq": float(r_eq_values[index]),
+                "R_eq": float(np.asarray(self._import_unit_to_si(
+                    "Req",
+                    r_eq_values[index],
+                    declared_units.get("Req", "m"),
+                )).reshape(-1)[0]),
                 "P_inf": float(p_inf_values[index]),
                 "rho": float(rho_values[index]),
             })
@@ -2812,6 +2960,7 @@ class MainWindow(QMainWindow):
         settings = {
             "view_mode": self._mat_to_string(mat, "view_mode", "dimensional").strip().lower(),
             "color_mode": self._mat_to_string(mat, "curve_color_mode", "distinct").strip().lower(),
+            "same_color": self._mat_to_string(mat, "same_curve_color", "#1f77b4").strip(),
             "xlim": np.asarray(mat.get("view_xlim", []), dtype=float).reshape(-1),
             "ylim": np.asarray(mat.get("view_ylim", []), dtype=float).reshape(-1),
             "x_zoom": np.asarray(mat.get("x_zoom_values", []), dtype=float).reshape(-1),
@@ -2823,11 +2972,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Import Curve View from .mat",
-            "",
+            self._file_dialog_start(),
             "MAT files (*.mat)",
         )
         if not path:
             return
+        self._remember_file_dialog_path(path)
         try:
             curves, settings = self._load_curve_view_mat(path)
         except Exception as exc:
@@ -2849,14 +2999,19 @@ class MainWindow(QMainWindow):
         self.state.view_mode = view_mode if view_mode in ("dimensional", "normalized") else "dimensional"
         self._update_view_buttons()
         color_mode = settings["color_mode"]
-        if color_mode not in ("distinct", "sweep"):
+        if color_mode not in ("distinct", "sweep", "same"):
             color_mode = "distinct"
         self._curve_color_mode = color_mode
+        same_color = QColor(settings.get("same_color", "#1f77b4"))
+        if same_color.isValid():
+            self._same_curve_color = same_color.name()
+            self._set_curve_color_combo_color(self.cmb_same_curve_color, self._same_curve_color)
         color_index = self.cmb_curve_color_mode.findData(color_mode)
         if color_index >= 0:
             self.cmb_curve_color_mode.blockSignals(True)
             self.cmb_curve_color_mode.setCurrentIndex(color_index)
             self.cmb_curve_color_mode.blockSignals(False)
+        self._update_same_curve_color_control()
 
         self._multi_curve_enabled = True
         self.chk_multi_curve.blockSignals(True)
@@ -2902,11 +3057,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Curve View as .mat",
-            f"{self._view_export_stem()}.mat",
+            self._file_dialog_start(f"{self._view_export_stem()}.mat"),
             "MAT files (*.mat)",
         )
         if not path:
             return
+        self._remember_file_dialog_path(path)
 
         n = len(curves)
         t_cells = np.empty((1, n), dtype=object)
@@ -2949,6 +3105,7 @@ class MainWindow(QMainWindow):
                 "imr_view_version": 2,
                 "view_mode": self.state.view_mode,
                 "curve_color_mode": self._curve_color_mode,
+                "same_curve_color": self._same_curve_color,
                 "time_unit": "s",
                 "radius_unit": "m",
                 "curve_t": t_cells,
@@ -2993,17 +3150,18 @@ class MainWindow(QMainWindow):
             self.canvas.draw_idle()
 
     def _on_export_view_svg(self):
-        if not self._view_curves:
+        if not self._ensure_view_curves_for_output():
             QMessageBox.information(self, "No curves", "There are no curves to export.")
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Curve View as .svg",
-            f"{self._view_export_stem()}.svg",
+            self._file_dialog_start(f"{self._view_export_stem()}.svg"),
             "SVG files (*.svg)",
         )
         if not path:
             return
+        self._remember_file_dialog_path(path)
 
         def _save():
             self.canvas.figure.savefig(
@@ -3015,11 +3173,15 @@ class MainWindow(QMainWindow):
                 bbox_inches="tight",
             )
 
-        self._with_curve_view_render(lambda: self._with_transparent_canvas(_save))
+        try:
+            self._with_curve_view_render(lambda: self._with_transparent_canvas(_save))
+        except Exception as exc:
+            QMessageBox.warning(self, "Export view failed", str(exc))
+            return
         self.statusBar().showMessage(f"Exported Curve View SVG: {path}")
 
     def _on_copy_view_png(self):
-        if not self._view_curves:
+        if not self._ensure_view_curves_for_output():
             QMessageBox.information(self, "No curves", "There are no curves to copy.")
             return
 
@@ -3051,7 +3213,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Copied Curve View PNG to clipboard.")
 
     def _on_copy_view_svg(self):
-        if not self._view_curves:
+        if not self._ensure_view_curves_for_output():
             QMessageBox.information(self, "No curves", "There are no curves to copy.")
             return
 
@@ -3294,10 +3456,11 @@ class MainWindow(QMainWindow):
         def _browse_output_dir():
             start_dir = le_output_dir.text().strip()
             if not start_dir or not Path(start_dir).exists():
-                start_dir = ""
+                start_dir = self._file_dialog_start()
             path = QFileDialog.getExistingDirectory(self, "Select default job output folder", start_dir)
             if path:
                 le_output_dir.setText(path)
+                self._remember_file_dialog_path(path, directory=True)
 
         btn_browse.clicked.connect(_browse_output_dir)
 
@@ -3684,6 +3847,34 @@ class MainWindow(QMainWindow):
             return Path(sys.executable).parent / "settings.json"
         return Path(__file__).parent / "settings.json"
 
+    def _file_dialog_start(self, filename: str = "") -> str:
+        directory = Path(self._last_file_directory)
+        if self._last_file_directory and directory.is_dir():
+            return str(directory / filename) if filename else str(directory)
+        return filename
+
+    def _remember_file_dialog_path(self, path: str, *, directory: bool = False):
+        folder = Path(path) if directory else Path(path).parent
+        if not folder.is_dir():
+            return
+        folder_str = str(folder.resolve())
+        if folder_str == self._last_file_directory:
+            return
+        self._last_file_directory = folder_str
+        settings_path = self._settings_path()
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+            if not isinstance(data, dict):
+                return
+            file_dialogs = data.get("file_dialogs", {})
+            if not isinstance(file_dialogs, dict):
+                file_dialogs = {}
+            file_dialogs["last_directory"] = folder_str
+            data["file_dialogs"] = file_dialogs
+            settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
     def _collect_parameter_defaults(self) -> dict:
         params = {}
         for name, row in self._param_rows.items():
@@ -3909,6 +4100,7 @@ class MainWindow(QMainWindow):
                 "remove_isolated_spikes": bool(self._import_wizard_remove_spikes),
                 "spike_threshold": float(self._import_wizard_spike_threshold),
             },
+            "file_dialogs": {"last_directory": self._last_file_directory},
         }
         if include_ui:
             current_model = self._get_active_model_key()
@@ -3946,6 +4138,12 @@ class MainWindow(QMainWindow):
             data = json.loads(text)
         except Exception:
             return
+
+        file_dialogs = data.get("file_dialogs", {})
+        if isinstance(file_dialogs, dict):
+            last_directory = file_dialogs.get("last_directory", "")
+            if isinstance(last_directory, str) and Path(last_directory).is_dir():
+                self._last_file_directory = last_directory
 
         ui = self._normalise_ui_defaults(data.get("ui", {}))
         self._saved_ui_defaults = ui
@@ -5273,6 +5471,72 @@ class MainWindow(QMainWindow):
             return np.asarray(value, dtype=float) * float(self._import_wizard_um_per_pixel) * 1e-6
         return value
 
+    @staticmethod
+    def _normalise_declared_time_unit(value: str) -> str | None:
+        text = str(value or "").strip().lower().replace("μ", "u").replace("µ", "u")
+        if text in {"s", "sec", "second", "seconds"}:
+            return "s"
+        if text in {"us", "usec", "microsecond", "microseconds"}:
+            return "us"
+        return None
+
+    @staticmethod
+    def _normalise_declared_radius_unit(value: str) -> str | None:
+        text = str(value or "").strip().lower().replace("μ", "u").replace("µ", "u")
+        if text in {"m", "meter", "meters", "metre", "metres"}:
+            return "m"
+        if text in {"um", "micrometer", "micrometers", "micrometre", "micrometres"}:
+            return "um"
+        if text in {"pixel", "pixels", "px"}:
+            return "pixel"
+        return None
+
+    def _declared_mat_units(self, mat: dict, flat: dict | None = None) -> dict[str, str]:
+        """Read units that describe the arrays currently stored in a MAT file."""
+        if flat is None:
+            flat = {
+                key: value
+                for key, value in self._wizard_flatten_namespace(mat).items()
+                if not str(key).startswith("__")
+            }
+        by_name = {str(key).lower(): value for key, value in flat.items()}
+
+        def declared_value(name: str):
+            for key in (name, f"struct_units.{name}", f"units.{name}"):
+                if key.lower() in by_name:
+                    return by_name[key.lower()]
+            return None
+
+        system = self._wizard_to_string(declared_value("unit_system"), "").strip().lower()
+        time_unit = self._normalise_declared_time_unit(
+            self._wizard_to_string(declared_value("time_unit"), "")
+        )
+        radius_unit = self._normalise_declared_radius_unit(
+            self._wizard_to_string(declared_value("radius_unit"), "")
+        )
+        if system in {"si", "mks"}:
+            time_unit = time_unit or "s"
+            radius_unit = radius_unit or "m"
+
+        units: dict[str, str] = {}
+        if time_unit:
+            units.update({name: time_unit for name in ("t_exp", "t_sim", "t_start", "t_end")})
+        if radius_unit:
+            units["R_exp"] = radius_unit
+            if radius_unit != "pixel":
+                units.update({name: radius_unit for name in ("R_sim", "Req", "Rmax")})
+        return units
+
+    @staticmethod
+    def _add_unit_system_to_export(export: dict):
+        """Mark dimensional result arrays and radius scalars as SI values."""
+        export.update({
+            "unit_metadata_version": 1,
+            "unit_system": "SI",
+            "time_unit": "s",
+            "radius_unit": "m",
+        })
+
     def _confirm_import_default_units(
         self,
         *,
@@ -5332,13 +5596,14 @@ class MainWindow(QMainWindow):
         keys = sorted(flat.keys(), key=str.lower)
         array_keys = [key for key in keys if self._wizard_is_numeric_array(flat[key])]
         scalar_keys = [key for key in keys if self._wizard_is_scalar_like(flat[key])]
+        declared_units = self._declared_mat_units(mat, flat)
         t_key = self._wizard_guess_key(array_keys, self._import_wizard_keywords["t_exp"])
         R_key = self._wizard_guess_key(array_keys, self._import_wizard_keywords["R_exp"])
         if not R_key:
             raise ValueError("Could not find R_exp using Import Wizard recognition names.")
 
-        r_unit = self._import_wizard_units.get("R_exp", "m")
-        t_unit = self._import_wizard_units.get("t_exp", "s")
+        r_unit = declared_units.get("R_exp", self._import_wizard_units.get("R_exp", "m"))
+        t_unit = declared_units.get("t_exp", self._import_wizard_units.get("t_exp", "s"))
         R = self._wizard_to_1d_float(flat[R_key])
         R = np.asarray(self._import_unit_to_si("R_exp", R, r_unit), dtype=float)
         used_fps = False
@@ -5353,11 +5618,13 @@ class MainWindow(QMainWindow):
             used_fps = True
         if t.shape[0] != R.shape[0]:
             raise ValueError(f"t_exp and R_exp length mismatch: {t.shape[0]} vs {R.shape[0]}.")
+        confirm_r_unit = r_unit if "R_exp" not in declared_units else "m"
+        confirm_t_unit = t_unit if "t_exp" not in declared_units else "s"
         if confirm_units and not self._confirm_import_default_units(
             parent=parent or self,
             used_fps=used_fps,
-            r_unit=r_unit,
-            t_unit=t_unit,
+            r_unit=confirm_r_unit,
+            t_unit=confirm_t_unit,
             accepted_state=accepted_state,
         ):
             raise RuntimeError("Import cancelled by user.")
@@ -5398,7 +5665,7 @@ class MainWindow(QMainWindow):
             val = self._wizard_to_float(flat[key], None)
             if val is None:
                 return None
-            unit = self._import_wizard_units.get(name, "")
+            unit = declared_units.get(name, self._import_wizard_units.get(name, ""))
             converted = self._import_unit_to_si(name, val, unit)
             try:
                 return float(np.asarray(converted).reshape(-1)[0])
@@ -5422,6 +5689,7 @@ class MainWindow(QMainWindow):
             "R_key": R_key,
             "t_unit": t_unit,
             "R_unit": r_unit,
+            "unit_source": "file" if declared_units else "import_defaults",
             "used_fps": bool(used_fps),
             "fps": float(self._import_wizard_fps),
             "um_per_pixel": float(self._import_wizard_um_per_pixel),
@@ -5595,6 +5863,7 @@ class MainWindow(QMainWindow):
             "- Req, R_eq, or R_equilibrium: equilibrium radius in meters\n"
             "- legend: curve label string\n"
             "- P_inf, rho, c_long, gamma: physical constants in SI units\n"
+            "- unit_system, time_unit, radius_unit: optional file-level unit metadata\n"
             "- struct_best_fit: saved fitting parameters and bounds"
         )
         btn_units = QPushButton("Use um/us")
@@ -5692,7 +5961,14 @@ class MainWindow(QMainWindow):
         buttons.addWidget(btn_close)
         root.addLayout(buttons)
 
-        ctx = {"path": "", "flat": {}, "mat": {}, "pixel_time_warning_accepted": False}
+        ctx = {
+            "path": "",
+            "flat": {},
+            "mat": {},
+            "declared_units": {},
+            "pixel_time_warning_accepted": False,
+            "unit_override_warning_accepted": False,
+        }
         array_rows: dict[str, QComboBox] = {}
         scalar_rows: dict[str, tuple[QComboBox, QLineEdit]] = {}
         unit_rows: dict[str, QComboBox] = {}
@@ -5740,7 +6016,9 @@ class MainWindow(QMainWindow):
                 "Req": "m",
                 "Rmax": "m",
             }
-            default = self._import_wizard_units.get(name, defaults.get(name))
+            default = ctx.get("declared_units", {}).get(
+                name, self._import_wizard_units.get(name, defaults.get(name))
+            )
             if default:
                 idx = combo.findData(default)
                 if idx >= 0:
@@ -5751,13 +6029,17 @@ class MainWindow(QMainWindow):
 
         def unit_label_for_name(name: str) -> QLabel:
             opts = unit_options_for_name(name)
-            label = QLabel(opts[0] if opts else "")
+            unit = ctx.get("declared_units", {}).get(name, opts[0] if opts else "")
+            label = QLabel(unit)
             label.setMinimumWidth(64)
             return label
 
         def unit_for_preview(name: str) -> str:
             combo = unit_rows.get(name)
             if combo is None:
+                declared = ctx.get("declared_units", {}).get(name)
+                if declared:
+                    return str(declared)
                 opts = unit_options_for_name(name)
                 return opts[0] if opts else ""
             return str(combo.currentData() or "")
@@ -5775,6 +6057,8 @@ class MainWindow(QMainWindow):
             return value
 
         def display_scalar(name: str, value: float) -> float:
+            if name in ctx.get("declared_units", {}):
+                return float(value)
             unit = unit_for_preview(name)
             if unit == "um":
                 return float(value) * 1e6
@@ -5899,7 +6183,18 @@ class MainWindow(QMainWindow):
             ctx["path"] = path
             ctx["flat"] = flat
             ctx["mat"] = mat
-            lbl_path.setText(path)
+            ctx["declared_units"] = self._declared_mat_units(mat, flat)
+            ctx["pixel_time_warning_accepted"] = False
+            ctx["unit_override_warning_accepted"] = False
+            declared_time = ctx["declared_units"].get("t_exp")
+            declared_radius = ctx["declared_units"].get("R_exp")
+            if declared_time or declared_radius:
+                lbl_path.setText(
+                    f"{path}\nFile units: time={declared_time or 'not declared'}, "
+                    f"radius={declared_radius or 'not declared'}"
+                )
+            else:
+                lbl_path.setText(path)
             clear_layout(arr_form)
             clear_layout(scalar_form)
             array_rows.clear()
@@ -6045,11 +6340,17 @@ class MainWindow(QMainWindow):
                 row.addWidget(unit_label_for_name(label))
                 scalar_form.addRow(f"{label}:", row)
 
+            using_micro_units["value"] = (
+                ctx["declared_units"].get("t_exp") == "us"
+                and ctx["declared_units"].get("R_exp") == "um"
+            )
+            btn_units.setText("Use SI units" if using_micro_units["value"] else "Use um/us")
             btn_apply.setEnabled(True)
             update_converted_preview()
+            self._remember_file_dialog_path(path)
 
         def choose_file():
-            path, _ = QFileDialog.getOpenFileName(dlg, "Import MAT file", "", "MAT files (*.mat)")
+            path, _ = QFileDialog.getOpenFileName(dlg, "Import MAT file", self._file_dialog_start(), "MAT files (*.mat)")
             if path:
                 try:
                     rebuild_for_path(path)
@@ -6131,6 +6432,27 @@ class MainWindow(QMainWindow):
             try:
                 path = str(ctx["path"])
                 param_count = 0
+                unit_overrides = []
+                for name, declared in ctx.get("declared_units", {}).items():
+                    combo = unit_rows.get(name)
+                    if combo is None:
+                        continue
+                    selected = str(combo.currentData() or "")
+                    if selected and selected != declared:
+                        unit_overrides.append(f"{name}: file={declared}, selected={selected}")
+                if unit_overrides and not ctx.get("unit_override_warning_accepted", False):
+                    reply = QMessageBox.warning(
+                        dlg,
+                        "Override file units?",
+                        "This MAT file declares its own units, but the Import Wizard selections differ:\n\n"
+                        + "\n".join(unit_overrides)
+                        + "\n\nContinue with the manually selected units?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+                    ctx["unit_override_warning_accepted"] = True
                 has_time_mapping = bool(array_rows.get("t_exp") and array_rows["t_exp"].currentData())
                 if (
                     has_time_mapping
@@ -6180,6 +6502,8 @@ class MainWindow(QMainWindow):
                     "R_key": str(R_key),
                     "t_unit": unit_for_preview("t_exp"),
                     "R_unit": unit_for_preview("R_exp"),
+                    "unit_source": "file" if ctx.get("declared_units") else "import_wizard",
+                    "file_units_overridden": bool(unit_overrides),
                     "used_fps": not bool(t_key),
                     "fps": float(spin_fps.value()),
                     "um_per_pixel": float(spin_um_per_pixel.value()),
@@ -6322,10 +6646,11 @@ class MainWindow(QMainWindow):
             )
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load experiment .mat", "", "MAT files (*.mat)"
+            self, "Load experiment .mat", self._file_dialog_start(), "MAT files (*.mat)"
         )
         if not path:
             return
+        self._remember_file_dialog_path(path)
         try:
             try:
                 exp = self._load_experiment_with_import_defaults(
@@ -6940,11 +7265,12 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Batch add experiments as jobs",
-            "",
+            self._file_dialog_start(),
             "MAT files (*.mat)",
         )
         if not paths:
             return
+        self._remember_file_dialog_path(paths[0])
 
         added: list[dict] = []
         skipped: list[str] = []
@@ -7948,10 +8274,27 @@ class MainWindow(QMainWindow):
         )
 
     def _job_from_result_mat(self, path: str, mat: dict) -> dict | None:
+        declared_units = self._declared_mat_units(mat)
         t_sim = self._mat_array(mat, "t_sim")
         R_sim = self._mat_array(mat, "R_sim")
         t_exp = self._mat_array(mat, "t_exp")
         R_exp = self._mat_array(mat, "R_exp")
+        for name, array in (
+            ("t_sim", t_sim), ("R_sim", R_sim),
+            ("t_exp", t_exp), ("R_exp", R_exp),
+        ):
+            unit = declared_units.get(name)
+            if not unit:
+                continue
+            converted = np.asarray(self._import_unit_to_si(name, array, unit), dtype=float).reshape(-1)
+            if name == "t_sim":
+                t_sim = converted
+            elif name == "R_sim":
+                R_sim = converted
+            elif name == "t_exp":
+                t_exp = converted
+            else:
+                R_exp = converted
         if t_sim.size < 3 or R_sim.size < 3 or t_exp.size < 3 or R_exp.size < 3:
             return None
 
@@ -8017,9 +8360,30 @@ class MainWindow(QMainWindow):
         p_inf = self._none_if_nan(self._mat_to_float(mat, "P_inf", None))
         rho = self._none_if_nan(self._mat_to_float(mat, "rho", None))
         gamma = self._none_if_nan(self._mat_to_float(mat, "gamma", None))
-        tc = self._mat_to_float(mat, "tc", 1.0)
-        rmax_sim = self._mat_to_float(mat, "Rmax_sim", float(np.max(R_sim)))
+        tc_raw = self._mat_to_float(mat, "tc", None)
+        tc = 1.0 if tc_raw is None else float(tc_raw)
+        rmax_sim_raw = self._mat_to_float(mat, "Rmax_sim", None)
+        rmax_sim = float(np.max(R_sim)) if rmax_sim_raw is None else float(rmax_sim_raw)
         rmax_exp = self._none_if_nan(self._mat_to_float(mat, "Rmax_exp", None))
+        radius_unit = declared_units.get("Req")
+        if radius_unit:
+            def radius_to_si(value):
+                if value is None:
+                    return None
+                return float(np.asarray(
+                    self._import_unit_to_si("Req", value, radius_unit)
+                ).reshape(-1)[0])
+
+            req_m = radius_to_si(req_m)
+            req_exp_m = radius_to_si(req_exp_m)
+            if rmax_sim_raw is not None:
+                rmax_sim = radius_to_si(rmax_sim)
+            rmax_exp = radius_to_si(rmax_exp)
+        time_unit = declared_units.get("t_exp")
+        if time_unit and tc_raw is not None:
+            tc = float(np.asarray(
+                self._import_unit_to_si("t_exp", tc, time_unit)
+            ).reshape(-1)[0])
         if rmax_exp is None and R_exp.size:
             try:
                 rmax_exp = float(find_rmax_value(t_exp, R_exp))
@@ -8242,6 +8606,13 @@ class MainWindow(QMainWindow):
         if vapor is not None:
             export["vapor_concentration_sim"] = np.asarray(vapor, dtype=float)
 
+    @staticmethod
+    def _add_import_metadata_to_export(export: dict, metadata: dict | None):
+        if metadata:
+            export["struct_import"] = {
+                str(key): value for key, value in MainWindow._json_safe(metadata).items()
+            }
+
     def _job_effective_req_m(
         self,
         job: dict,
@@ -8312,7 +8683,9 @@ class MainWindow(QMainWindow):
             "NT": int(phys.get("NT", 0)),
             "LSQErr": np.nan if lsq_err is None else float(lsq_err),
         }
+        self._add_unit_system_to_export(export)
         self._add_sim_diagnostics_to_export(export, out)
+        self._add_import_metadata_to_export(export, exp.get("import_metadata"))
         legend = str(job.get("legend", "")).strip()
         if legend:
             export["legend"] = legend
@@ -8397,7 +8770,9 @@ class MainWindow(QMainWindow):
             "imr_result_kind": "fit",
             "LSQErr": float(res.lsq_err),
         }
+        self._add_unit_system_to_export(export)
         self._add_sim_diagnostics_to_export(export, out)
+        self._add_import_metadata_to_export(export, exp.get("import_metadata"))
         fit_window = dict(job.get("fit_window", {}) or {})
         export["fit_window_mode"] = str(fit_window.get("mode", ""))
         export["fit_window_cycles"] = (
@@ -8474,6 +8849,7 @@ class MainWindow(QMainWindow):
                 "P_inf": exp.get("P_inf"),
                 "rho": exp.get("rho"),
                 "R_eq": exp.get("R_eq"),
+                "import_metadata": exp.get("import_metadata", {}),
             },
             "model": job.get("model", ""),
             "req_from_params": bool(job.get("req_from_params", False)),
@@ -8512,11 +8888,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export job queue",
-            "",
+            self._file_dialog_start(),
             "IMR job queue (*.imrqueue);;ZIP archive (*.zip)",
         )
         if not path:
             return
+        self._remember_file_dialog_path(path)
         out_path = Path(path)
         if out_path.suffix.lower() not in (".imrqueue", ".zip"):
             out_path = out_path.with_suffix(".imrqueue")
@@ -8560,10 +8937,11 @@ class MainWindow(QMainWindow):
         out_dir = QFileDialog.getExistingDirectory(
             self,
             "Select folder for job queue CSV files",
-            self._job_output_dir if self._job_output_dir and Path(self._job_output_dir).exists() else "",
+            self._file_dialog_start(),
         )
         if not out_dir:
             return
+        self._remember_file_dialog_path(out_dir, directory=True)
 
         groups: dict[str, list[tuple[int, dict]]] = {}
         for row, job in enumerate(self._jobs, start=1):
@@ -8683,6 +9061,7 @@ class MainWindow(QMainWindow):
                 "P_inf": p_inf,
                 "rho": rho,
                 "R_eq": r_eq,
+                "import_metadata": dict(exp_meta.get("import_metadata", {}) or {}),
             },
             "model": meta.get("model", ""),
             "req_from_params": bool(meta.get("req_from_params", False)),
@@ -8740,11 +9119,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Import job queue",
-            "",
+            self._file_dialog_start(),
             "IMR job queue (*.imrqueue *.zip);;All files (*.*)",
         )
         if not path:
             return
+        self._remember_file_dialog_path(path)
 
         try:
             imported: list[dict] = []
@@ -8812,10 +9192,11 @@ class MainWindow(QMainWindow):
             out_dir = QFileDialog.getExistingDirectory(
                 self,
                 "Select output folder for queue results",
-                out_dir if out_dir and Path(out_dir).exists() else "",
+                out_dir if out_dir and Path(out_dir).is_dir() else self._file_dialog_start(),
             )
             if not out_dir:
                 return
+            self._remember_file_dialog_path(out_dir, directory=True)
             self._job_output_dir = out_dir
             self._save_settings()
 
@@ -9689,9 +10070,10 @@ class MainWindow(QMainWindow):
     # =====================================================================
 
     def on_save_params(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save parameters", "", "MAT files (*.mat)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save parameters", self._file_dialog_start(), "MAT files (*.mat)")
         if not path:
             return
+        self._remember_file_dialog_path(path)
 
         names = list(self._param_rows.keys())
         params = self._get_param_si()
@@ -9732,16 +10114,18 @@ class MainWindow(QMainWindow):
             return
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export result", "", "MAT files (*.mat)"
+            self, "Export result", self._file_dialog_start(), "MAT files (*.mat)"
         )
         if not path:
             return
+        self._remember_file_dialog_path(path)
 
         try:
             def col(arr):
                 return np.asarray(arr, dtype=float).reshape(-1, 1)
 
             export: dict = {}
+            self._add_unit_system_to_export(export)
 
             # --- simulation ---
             export["t_sim"]        = col(out.t_sim)
@@ -9781,12 +10165,9 @@ class MainWindow(QMainWindow):
                 export["fit_window_t_start_s"] = float(t0)
                 export["fit_window_t_end_s"] = float(t1)
                 export["fit_window_n_points"] = int(np.count_nonzero((t_exp >= t0) & (t_exp <= t1)))
-                import_meta = getattr(self.state, "import_metadata", None)
-                if import_meta:
-                    safe_meta = self._json_safe(import_meta)
-                    export["struct_import"] = {
-                        str(key): value for key, value in safe_meta.items()
-                    }
+                self._add_import_metadata_to_export(
+                    export, getattr(self.state, "import_metadata", None)
+                )
 
             # --- parameters (same struct format as Save parameters) ---
             names  = list(self._param_rows.keys())
@@ -9830,10 +10211,11 @@ class MainWindow(QMainWindow):
 
     def on_load_params(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load parameters", "", "MAT files (*.mat)"
+            self, "Load parameters", self._file_dialog_start(), "MAT files (*.mat)"
         )
         if not path:
             return
+        self._remember_file_dialog_path(path)
         self._load_params_from_path(path)
 
     def _load_params_from_path(self, path: str):

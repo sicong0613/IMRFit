@@ -146,47 +146,76 @@ class _UserStop(Exception):
 # helpers
 # -----------------------------------------------------------------------
 
+_INVALID_FIT_ERROR = 1e10
+_MAX_TSPAN_FACTOR = 8.0
+_MAX_TSPAN_EXTENSIONS = 4
+_MAX_LEFT_TRIM_POINTS = 3
+
+
+def _evaluate_window(
+    params_si: dict,
+    make_sim: Callable[[dict, float], object],
+    t_exp: NDArray[np.float64],
+    R_exp: NDArray[np.float64],
+    tspan_factor: float,
+) -> tuple[float, object | None]:
+    if t_exp.size < 3 or R_exp.size != t_exp.size:
+        return _INVALID_FIT_ERROR, None
+
+    window_span = float(t_exp[-1] - t_exp[0])
+    if not np.isfinite(window_span) or window_span <= 0:
+        return _INVALID_FIT_ERROR, None
+    initial_tspan = max(window_span * tspan_factor, window_span)
+    max_tspan = initial_tspan * _MAX_TSPAN_FACTOR
+    tspan = initial_tspan
+
+    for attempt in range(_MAX_TSPAN_EXTENSIONS + 1):
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                out = make_sim(params_si, tspan)
+        except Exception:
+            return _INVALID_FIT_ERROR, None
+
+        t_sim = np.asarray(out.t_sim, dtype=float).reshape(-1)
+        R_sim = np.asarray(out.R_sim, dtype=float).reshape(-1)
+        if (t_sim.size < 3 or R_sim.size != t_sim.size
+                or not np.all(np.isfinite(t_sim)) or not np.all(np.isfinite(R_sim))
+                or np.any(np.diff(t_sim) <= 0)):
+            return _INVALID_FIT_ERROR, None
+
+        # A longer run can extend the right edge; it can move the shifted
+        # left edge only while the simulated peak is still at the endpoint.
+        peak_at_end = int(np.argmax(R_sim)) >= R_sim.size - 2
+        n_left_trim = int(np.searchsorted(t_exp, t_sim[0], side="left"))
+        if (n_left_trim > _MAX_LEFT_TRIM_POINTS or t_exp.size - n_left_trim < 3) and not peak_at_end:
+            return _INVALID_FIT_ERROR, None
+        if (n_left_trim <= _MAX_LEFT_TRIM_POINTS
+                and t_exp.size - n_left_trim >= 3
+                and t_sim[-1] >= t_exp[-1]):
+            t_fit = t_exp[n_left_trim:]
+            R_interp = np.interp(t_fit, t_sim, R_sim)
+            err = float(np.mean(((R_exp[n_left_trim:] - R_interp) * 1e6) ** 2))
+            return (err, out) if np.isfinite(err) else (_INVALID_FIT_ERROR, None)
+
+        if attempt == _MAX_TSPAN_EXTENSIONS or tspan >= max_tspan:
+            break
+        missing = max(
+            float(t_exp[-1] - t_sim[-1]),
+            float(t_sim[0] - t_exp[0]) if peak_at_end and n_left_trim > _MAX_LEFT_TRIM_POINTS else 0.0,
+        )
+        tspan = min(max_tspan, max(tspan * 1.5, tspan + 1.2 * missing))
+
+    return _INVALID_FIT_ERROR, None
+
+
 def _eval_and_sim(
     params_si: dict,
     cfg: FitConfig,
 ) -> tuple[float, object | None]:
-    t_exp = cfg.t_exp
-    R_exp = cfg.R_exp
-    if t_exp.size < 3 or R_exp.size < 3:
-        return 1e10, None
-
-    tspan = (t_exp[-1] - t_exp[0]) * cfg.tspan_factor
-    if tspan <= 0:
-        tspan = t_exp[-1] - t_exp[0] if t_exp[-1] > t_exp[0] else 1e-6
-
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
-            out = cfg.make_sim(params_si, tspan)
-    except Exception:
-        return 1e10, None
-
-    t_sim = out.t_sim
-    R_sim = out.R_sim
-    if t_sim.size < 3 or R_sim.size < 3:
-        return 1e10, None
-
-    covered = (t_exp >= float(t_sim[0])) & (t_exp <= float(t_sim[-1]))
-    if int(np.count_nonzero(covered)) < 3:
-        return 1e10, out
-    t_eval = t_exp[covered]
-    R_eval = R_exp[covered]
-
-    try:
-        R_sim_interp = np.interp(t_eval, t_sim, R_sim)
-    except Exception:
-        return 1e10, None
-
-    # Mean squared error in µm² — dividing by n makes it comparable across
-    # experiments with different data densities.
-    n = max(t_eval.size, 1)
-    err = float(np.sum(((R_eval - R_sim_interp) * 1e6) ** 2) / n)
-    return (err if np.isfinite(err) else 1e10), out
+    return _evaluate_window(
+        params_si, cfg.make_sim, cfg.t_exp, cfg.R_exp, cfg.tspan_factor
+    )
 
 
 # -----------------------------------------------------------------------
@@ -196,8 +225,8 @@ def _eval_and_sim(
 class _DEObjFn:
     """Module-level picklable wrapper used by DE with workers > 1.
 
-    Replicates the core logic of _eval_and_sim without holding any
-    Qt or closure references so it survives multiprocessing pickle.
+    Uses the shared window evaluator without holding any Qt or closure
+    references so it survives multiprocessing pickle.
     """
 
     def __init__(self, active, fixed, mp_make_sim, t_exp, R_exp, tspan_factor):
@@ -216,35 +245,12 @@ class _DEObjFn:
         return p
 
     def __call__(self, theta_opt):
-        import warnings
-        t_exp, R_exp = self.t_exp, self.R_exp
-        if t_exp.size < 3 or R_exp.size < 3:
-            return 1e10
-        tspan = (t_exp[-1] - t_exp[0]) * self.tspan_factor
-        if tspan <= 0:
-            tspan = max(t_exp[-1] - t_exp[0], 1e-6)
         params_si = self._to_si(theta_opt)
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=RuntimeWarning)
-                out = self.mp_make_sim(params_si, tspan)
-        except Exception:
-            return 1e10
-        t_sim, R_sim = out.t_sim, out.R_sim
-        if t_sim.size < 3 or R_sim.size < 3:
-            return 1e10
-        covered = (t_exp >= float(t_sim[0])) & (t_exp <= float(t_sim[-1]))
-        if int(np.count_nonzero(covered)) < 3:
-            return 1e10
-        t_eval = t_exp[covered]
-        R_eval = R_exp[covered]
-        try:
-            R_interp = np.interp(t_eval, t_sim, R_sim)
-        except Exception:
-            return 1e10
-        n = max(t_eval.size, 1)
-        err = float(np.sum(((R_eval - R_interp) * 1e6) ** 2) / n)
-        return err if np.isfinite(err) else 1e10
+        err, _ = _evaluate_window(
+            params_si, self.mp_make_sim, self.t_exp, self.R_exp,
+            self.tspan_factor,
+        )
+        return err
 
 
 # -----------------------------------------------------------------------
@@ -1030,9 +1036,15 @@ def fit_nhkv_to_experiment(
     else:
         raise RuntimeError("Fitting produced no valid result.")
 
-    best_out = tracker.get("best_out")
+    best_out = tracker.get("best_out") if best_params == tracker.get("best_params") else None
     if best_out is None:
-        _, best_out = _eval_and_sim(best_params, cfg)
+        best_err, best_out = _eval_and_sim(best_params, cfg)
+    if best_out is None:
+        raise RuntimeError(
+            "No fitted simulation covers the right edge of the fitting window "
+            "with at most 3 leftmost points omitted. Check the window, "
+            "initial parameters, and model, or extend the simulation range."
+        )
 
     return FitResult(
         best_params=best_params,

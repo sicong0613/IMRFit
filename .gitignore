@@ -13,6 +13,7 @@ todo.md
 build/
 dist/
 *.spec
+!IMR_GUI.spec
 
 # LaTeX build artifacts
 *.aux
